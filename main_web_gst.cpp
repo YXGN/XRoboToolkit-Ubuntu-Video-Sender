@@ -93,6 +93,7 @@ int main(int argc, char *argv[]) {
   bool preview_enabled = false;
   std::string server_ip = "127.0.0.1";
   int server_port = 12345;
+  std::string video_device = "/dev/video0";
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -104,6 +105,8 @@ int main(int argc, char *argv[]) {
       server_ip = argv[++i];
     } else if (arg == "--port" && i + 1 < argc) {
       server_port = std::stoi(argv[++i]);
+    } else if (arg == "--device" && i + 1 < argc) {
+      video_device = argv[++i];
     } else if (arg == "--help") {
       std::cout << "Usage: " << argv[0] << " [options]\n";
       std::cout << "Options:\n";
@@ -111,6 +114,7 @@ int main(int argc, char *argv[]) {
       std::cout << "  --send         Enable sending encoded video over TCP\n";
       std::cout << "  --server IP    Server IP address (default: 127.0.0.1)\n";
       std::cout << "  --port PORT    Server port (default: 12345)\n";
+      std::cout << "  --device PATH  Video device path (default: /dev/video0)\n";
       std::cout << "  --help         Show this help message\n";
       return 0;
     }
@@ -133,22 +137,22 @@ int main(int argc, char *argv[]) {
 
   if (preview_enabled) {
     pipeline_desc =
-        "v4l2src device=/dev/video0 ! "
+        "v4l2src device=" + video_device + " ! "
         "video/x-raw,width=1280,height=720 ! "
         "videoconvert ! "
-        "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
         "tee name=t "
-        "t. ! queue ! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 ! "
+        "t. ! queue ! x264enc tune=zerolatency bitrate=4000 "
+        "speed-preset=ultrafast key-int-max=30 ! "
         "h264parse ! appsink name=mysink emit-signals=true sync=false "
-        "t. ! queue ! nvvidconv ! video/x-raw ! videoconvert ! autovideosink "
+        "t. ! queue ! videoconvert ! autovideosink "
         "sync=false";
   } else {
     pipeline_desc =
-        "v4l2src device=/dev/video0 ! "
+        "v4l2src device=" + video_device + " ! "
         "video/x-raw,width=1280,height=720 ! "
         "videoconvert ! "
-        "nvvidconv ! "
-        "nvv4l2h264enc maxperf-enable=1 bitrate=4000000 ! "
+        "x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast "
+        "key-int-max=30 ! "
         "h264parse ! appsink name=mysink emit-signals=true sync=false";
   }
 

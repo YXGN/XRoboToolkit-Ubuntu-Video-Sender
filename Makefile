@@ -13,20 +13,20 @@ APP := OrinVideoSender
 ###############################################################################
 # WebCam
 
-# # TCP w/o asio -- pass
-# SRCS := \
-# 	main_web_gst.cpp
+# TCP w/o asio -- default for generic Ubuntu
+SRCS := \
+	main_web_gst.cpp
 ###############################################################################
 
 ###############################################################################
 # ZED
 
 # TCP w/o asio -- pass
-SRCS := \
- 	main_zed_tcp.cpp
+# SRCS := \
+#  	main_zed_tcp.cpp
 
 #SRCS := \
-	main_zed_tcp_zmq.cpp
+#	main_zed_tcp_zmq.cpp
 
 # # TCP with asio -- pass
 # SRCS := \
@@ -46,9 +46,7 @@ OBJS := $(SRCS:.cpp=.o)
 # Include paths
 CPPFLAGS := -std=c++11 \
 	-I./asio-1.30.2/include \
-	-I/usr/local/zed/include \
 	-I/usr/include/opencv4 \
-	-I/usr/local/cuda/include \
 	$(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 glib-2.0 2>/dev/null || echo "") \
 	$(shell pkg-config --cflags libzmq 2>/dev/null || echo "")
 
@@ -59,16 +57,16 @@ CXXFLAGS := -Wall -Wextra -O2 -g
 CXXFLAGS += $(shell pkg-config --cflags libavcodec libavformat libavutil libswscale libavdevice 2>/dev/null || echo "")
 
 # Library paths and libraries
-LDFLAGS := -L/usr/local/zed/lib \
-	-L/usr/local/cuda/lib64
+LDFLAGS := \
+	# -L/usr/local/cuda/lib64
 	# -L/usr/lib/aarch64-linux-gnu
 
-# FFmpeg libraries (must come first to avoid conflicts)
+# FFmpeg libraries
 LDFLAGS += $(shell pkg-config --libs libavcodec libavformat libavutil libswscale libavdevice 2>/dev/null || echo "-lavcodec -lavformat -lavutil -lswscale -lavdevice")
 
 # Core libraries
-LDFLAGS += -lsl_zed \
-	-lcuda -lcudart \
+LDFLAGS += \
+	# -lcuda -lcudart \
 	-lopencv_core -lopencv_imgproc -lopencv_videoio -lopencv_imgcodecs \
 	-lssl -lcrypto \
 	-lpthread \

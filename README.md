@@ -1,5 +1,6 @@
 # XRoboToolkit-Orin-Video-Sender
-Video Previewer/Encoder/Sender on Nvidia Jetson Orin Platform
+Video Previewer/Encoder/Sender with ZED default path retained for Ubuntu
+deployment (CUDA dependencies removed from default build flags).
 
 ![Screenshot](Docs/screenshot.png)
 > Sender (Webcam): `./OrinVideoSender --preview --send --server 192.168.1.176 --port 12345`
@@ -14,17 +15,31 @@ Video Previewer/Encoder/Sender on Nvidia Jetson Orin Platform
 - TCP/UDP sending w/ and w/o ASIO
 
 
-## How to
+## Ubuntu deployment (keep ZED default)
 
-- Setup necessary environment on Orin
+- Install dependencies on Ubuntu
+```
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential pkg-config \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+  libopencv-dev libssl-dev libzmq3-dev
+```
+
+- Install ZED SDK if you want to run the default ZED target (`main_zed_tcp.cpp`)
+  because the default `Makefile` still links against ZED libraries.
+
+- Optional: verify webcam software encoder path (`main_web_gst.cpp`)
+```
+gst-inspect-1.0 x264enc
+```
 
 - Build
 ```
-# Update `Makefile` to choose the protocol [TCP/UDP], camera type [Webcam/ZED], w/ or w/o ASIO.
-# Default: TCP w/o asio.
-
-# install zmq
-sudo apt-get install libzmq3-dev
+# Default in Makefile: ZED TCP entry (main_zed_tcp.cpp)
+# Webcam fallback with software encoding is available in main_web_gst.cpp.
 
 make
 
@@ -41,6 +56,13 @@ make
 # Add `--preview` to show the video on Orin if necessary 
 ./OrinVideoSender --send --server 192.168.1.176 --port 12345
 ```
+
+## Notes on platform-specific paths
+
+- ZED-related source files and default build entry are retained.
+- CUDA/Jetson-specific linker dependencies are commented out in `Makefile` for
+  generic Ubuntu compatibility.
+- `main_web_gst.cpp` uses `x264enc` software encoding for non-Jetson webcam use.
 
 ## One More Thing 
 
