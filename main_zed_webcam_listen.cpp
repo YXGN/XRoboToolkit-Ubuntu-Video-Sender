@@ -224,27 +224,6 @@ int send_to_port = 0;
 // 命令行：若非空则强制使用该 V4L2 设备；否则自动枚举首个 1920x1080 可用节点
 static std::string g_cli_camera_path;
 
-// ---------------------------------------------------------------------------
-// 实验选项（Pico 白屏 / 码流格式联调）：中文说明见 --help
-// ---------------------------------------------------------------------------
-// h264parse 之后、appsink 之前是否强制 caps：空=不强制（与原先一致，由元素协商）
-// 非空时仅允许 "byte-stream"（Annex B 起始码）或 "avc"（长度前缀 NAL，AVCC 一类）
-static std::string g_h264_out_format;
-
-// 若非空且当前为 H.264（非 HEVC），将 appsink 收到的每帧负载原样追加写入该路径；
-// 内容与发往 TCP 的「去掉 4 字节大端长度前缀后的 payload」一致，便于 ffprobe/ffplay 自证
-static std::string g_dump_h264_path;
-static std::mutex g_dump_h264_mutex;
-static FILE *g_dump_h264_fp = nullptr;
-
-static void closeH264DumpFile() {
-  std::lock_guard<std::mutex> lk(g_dump_h264_mutex);
-  if (g_dump_h264_fp) {
-    fclose(g_dump_h264_fp);
-    g_dump_h264_fp = nullptr;
-  }
-}
-
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_helper(Args &&...args) {
   return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
@@ -419,19 +398,9 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer /*user_data*/) {
 
   GstBuffer *buffer = gst_sample_get_buffer(sample);
   GstMapInfo map;
-    if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+  if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
     const uint8_t *data = map.data;
     gsize size = map.size;
-
-    // 实验：可选落盘（与 TCP 负载同一段字节，不含 4 字节长度头）
-    if (!g_dump_h264_path.empty() && data && size > 0) {
-      std::lock_guard<std::mutex> lk(g_dump_h264_mutex);
-      if (g_dump_h264_fp) {
-        if (fwrite(data, 1, size, g_dump_h264_fp) != size)
-          std::cerr << "实验落盘：写入字节数与 buffer 长度不一致" << std::endl;
-        fflush(g_dump_h264_fp);
-      }
-    }
 
     if (send_enabled.load() && sender_ptr && sender_ptr->isConnected() &&
         data && size > 0) {
@@ -542,8 +511,6 @@ void stopStreamingThread() {
     streaming_thread = nullptr;
     std::cout << "Stopped streaming thread" << std::endl;
   }
-  // 确保推流线程异常退出时也会关掉实验落盘文件
-  closeH264DumpFile();
 }
 
 // ============================================================================
@@ -584,25 +551,17 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
                     " ! h265parse ! appsink name=mysink emit-signals=true "
                     "sync=false ";
   } else {
-    // Pico / Android MediaCodec 硬件解码普遍只稳定支持 4:2:0（yuv420p），不支持
-    // High 4:4:4 Predictive + yuv444p。BGRA 直入 x264enc 易选 444 档，ffprobe 能解、头显白屏。
-    // 编码支路强制 I420 + profile=high，与 Jetson NVENC 常见 420 语义对齐；若仍不兼容可改 baseline。
+    // Pico / Android MediaCodec：4:2:0 + High；BGRA 直入 x264enc 易成 yuv444 / High444，头显白屏。
+    // h264parse 后固定 Annex B（byte-stream）+ AU 对齐，与 Pico MediaCodec 输入假设一致（勿改默认）。
     pipeline_str +=
         "t. ! queue ! videoconvert ! video/x-raw,format=I420 ! "
         "x264enc profile=high tune=zerolatency bitrate=" +
         std::to_string(bitrate_kbps) +
         " speed-preset=ultrafast key-int-max=" +
-        std::to_string(key_int_max) + " ! h264parse ";
-    // 实验：强制下游 caps，便于对比 Jetson 硬件码流在 MediaCodec 侧的假设（byte-stream vs avc）
-    if (g_h264_out_format == "byte-stream") {
-      pipeline_str +=
-          "! video/x-h264,stream-format=(string)byte-stream,"
-          "alignment=(string)au ";
-    } else if (g_h264_out_format == "avc") {
-      pipeline_str +=
-          "! video/x-h264,stream-format=(string)avc,alignment=(string)au ";
-    }
-    pipeline_str +=
+        std::to_string(key_int_max) +
+        " ! h264parse "
+        "! video/x-h264,stream-format=(string)byte-stream,"
+        "alignment=(string)au "
         "! appsink name=mysink emit-signals=true sync=false ";
   }
 
@@ -688,11 +647,6 @@ static std::string pickAuto1080pDevice() {
 void streamingThreadFunction() {
   std::cout << "Streaming thread started" << std::endl;
 
-  // 推流线程任意退出路径都关闭实验落盘句柄，避免句柄泄漏或二次 fopen 未定义行为
-  struct H264DumpSessionGuard {
-    ~H264DumpSessionGuard() { closeH264DumpFile(); }
-  } dump_session_guard;
-
   try {
     if (!initialize_sender()) {
       std::cerr << "Failed to initialize sender, streaming thread stopping"
@@ -756,23 +710,6 @@ void streamingThreadFunction() {
     }
 
     g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), nullptr);
-
-    // 实验：本轮会话以截断写打开；仅 H.264 分支有意义（HEVC 时 appsink 非 H.264，不落盘）
-    if (!g_dump_h264_path.empty() && !config.enableMvHevc) {
-      std::lock_guard<std::mutex> lk(g_dump_h264_mutex);
-      if (g_dump_h264_fp) {
-        fclose(g_dump_h264_fp);
-        g_dump_h264_fp = nullptr;
-      }
-      g_dump_h264_fp = fopen(g_dump_h264_path.c_str(), "wb");
-      if (g_dump_h264_fp)
-        std::cout << "实验：H.264 裸码流将同步写入 " << g_dump_h264_path
-                  << "（与 TCP 每帧 payload 相同，无 4 字节大端长度前缀）"
-                  << std::endl;
-      else
-        std::cerr << "实验：无法打开落盘文件: " << g_dump_h264_path
-                  << std::endl;
-    }
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
@@ -872,28 +809,11 @@ int main(int argc, char *argv[]) {
       listen_address = argv[++i];
     } else if (arg == "--camera" && i + 1 < argc) {
       g_cli_camera_path = argv[++i];
-    } else if (arg == "--dump-h264" && i + 1 < argc) {
-      // 联调：把编码器输出写到本地，便于 ffprobe/ffplay 验证是否可解码
-      g_dump_h264_path = argv[++i];
-    } else if (arg == "--h264-format" && i + 1 < argc) {
-      // 联调：h264parse 后强制 byte-stream（Annex B）或 avc（AVCC），default 表示不强制 caps
-      std::string v = argv[++i];
-      if (v == "default" || v == "none" || v == "")
-        g_h264_out_format.clear();
-      else if (v == "byte-stream" || v == "avc")
-        g_h264_out_format = v;
-      else {
-        std::cerr << "错误：--h264-format 仅支持 default | byte-stream | avc，收到: "
-                  << v << std::endl;
-        return -1;
-      }
     } else if (arg == "--help") {
       std::cout << "用法: " << argv[0] << " [选项]\n";
       std::cout << "  --listen IP:PORT  必选：控制通道监听地址（Pico 连接此端口发 OPEN_CAMERA）\n";
       std::cout << "  --preview         可选：本机 GStreamer 预览窗口\n";
       std::cout << "  --camera PATH     可选：强制使用指定设备，如 /dev/video0；不设则自动选首个 1920x1080\n";
-      std::cout << "  --dump-h264 PATH  可选（实验）：H.264 时将 appsink 负载写入文件（与 TCP payload 一致）\n";
-      std::cout << "  --h264-format F   可选（实验）：default | byte-stream | avc，控制 h264parse 后强制 caps\n";
       std::cout << "  --help            显示本帮助\n";
       std::cout << "\n说明：本二进制无 ZED SDK，用 USB 摄像头伪装 ZED 侧协议供 XRoboToolkit 使用。\n";
       return 0;

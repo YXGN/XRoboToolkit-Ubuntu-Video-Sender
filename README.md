@@ -10,6 +10,7 @@
 - 收到 `OPEN_CAMERA` 后，按载荷中的 **`ip` + `port`** 作为 **TCP 客户端** 连接头显视频接收端，推送 **`4 字节大端长度 + H.264（或 HEVC）`** 码流（与 ZED 版 Sender 一致）。
 - 视频来自 **USB 摄像头**：可用 `--camera /dev/videoN` 指定；否则自动选择 **编号升序下第一个能以 1920×1080 采到一帧** 的设备。
 - 将单目画面 **左右复制并排**，再缩放到 `OPEN_CAMERA` 中的宽高（BGRA），经 **GStreamer `x264enc` / `x265enc`** 软件编码。
+- H.264 路径默认：**I420 + profile High**，且 **`h264parse` 后固定 Annex B（byte-stream）**，无需额外参数即可供 Pico 解码。
 
 ### 依赖（Ubuntu）
 
