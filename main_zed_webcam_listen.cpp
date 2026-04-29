@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "network_helper.hpp"
@@ -221,8 +223,9 @@ std::unique_ptr<TCPServer> server_ptr;
 std::string send_to_server = "";
 int send_to_port = 0;
 
-// 命令行：若非空则强制使用该 V4L2 设备；否则自动枚举首个 1920x1080 可用节点
+// 命令行：默认单目输入（复制成左右）；可选 stereo-camera 表示输入已是左右拼接(SBS)
 static std::string g_cli_camera_path;
+static std::string g_cli_stereo_camera_path;
 
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_helper(Args &&...args) {
@@ -609,6 +612,7 @@ static bool probe1080pDevice(const std::string &device_path, std::string &err) {
   return true;
 }
 
+// 自动挑选一个可用节点：编号最小且可 1920x1080 采一帧
 static std::string pickAuto1080pDevice() {
   glob_t gbuf;
   memset(&gbuf, 0, sizeof(gbuf));
@@ -626,7 +630,6 @@ static std::string pickAuto1080pDevice() {
     numbered.push_back(std::make_pair(n, p));
   }
   globfree(&gbuf);
-
   std::sort(numbered.begin(), numbered.end());
 
   for (const auto &pr : numbered) {
@@ -634,14 +637,79 @@ static std::string pickAuto1080pDevice() {
     if (probe1080pDevice(pr.second, err)) {
       std::cout << "自动选中摄像头: " << pr.second << " (1920x1080)" << std::endl;
       return pr.second;
+    } else {
+      std::cout << "跳过 " << pr.second << " : " << err << std::endl;
     }
-    std::cout << "跳过 " << pr.second << " : " << err << std::endl;
   }
   return std::string();
 }
 
+// RealSense 等双目 MJPEG 常见为 1856×800 SBS（与 mono 自动探测的 1920×1080 不同）
+static constexpr int kStereoSbsCaptureWidth = 1856;
+static constexpr int kStereoSbsCaptureHeight = 800;
+
+/// 依次尝试 /dev/videoN + CAP_V4L2、path + CAP_V4L2、默认后端；失败时用 open(2) 区分 errno 与 OpenCV 失败
+static bool openUsbCapture(const std::string &device, bool stereo_sbs, int fps,
+                           cv::VideoCapture &cap, std::string &err_detail) {
+  err_detail.clear();
+
+  auto configure = [&](cv::VideoCapture &c) -> bool {
+    if (!c.isOpened())
+      return false;
+    if (stereo_sbs) {
+      c.set(cv::CAP_PROP_FOURCC,
+            cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+      c.set(cv::CAP_PROP_FRAME_WIDTH, kStereoSbsCaptureWidth);
+      c.set(cv::CAP_PROP_FRAME_HEIGHT, kStereoSbsCaptureHeight);
+    } else {
+      c.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+      c.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+    }
+    c.set(cv::CAP_PROP_FPS, fps);
+    return true;
+  };
+
+  cv::VideoCapture tmp;
+
+  // Linux 上默认会先尝试 GStreamer（日志 cap_gstreamer），易与 v4l2src/独占纠缠；
+  // USB 摄像头优先用 CAP_V4L2；字符串路径与整数索引都试一下。
+  int vid = -1;
+  if (std::sscanf(device.c_str(), "/dev/video%d", &vid) == 1 && vid >= 0) {
+    tmp.open(vid, cv::CAP_V4L2);
+    if (configure(tmp)) {
+      cap = std::move(tmp);
+      return true;
+    }
+    tmp.release();
+  }
+
+  tmp.open(device, cv::CAP_V4L2);
+  if (configure(tmp)) {
+    cap = std::move(tmp);
+    return true;
+  }
+  tmp.release();
+
+  tmp.open(device);
+  if (configure(tmp)) {
+    cap = std::move(tmp);
+    return true;
+  }
+  tmp.release();
+
+  int fd = ::open(device.c_str(), O_RDWR | O_NONBLOCK);
+  if (fd < 0) {
+    err_detail = strerror(errno);
+  } else {
+    ::close(fd);
+    err_detail =
+        "OpenCV 仍未打开（底层节点可读）；若需独占请先关掉其它取流进程";
+  }
+  return false;
+}
+
 // ============================================================================
-// 八、推流线程：OpenCV 采集 -> 左右复制 -> 缩放到 Pico 请求分辨率 -> appsrc
+// 八、推流线程：OpenCV 单路采集 -> 左右复制或SBS直通 -> 缩放到 Pico 请求分辨率 -> appsrc
 // ============================================================================
 
 void streamingThreadFunction() {
@@ -667,22 +735,28 @@ void streamingThreadFunction() {
     int out_h = config.height > 0 ? config.height : 720;
     int fps = config.fps > 0 ? config.fps : 30;
 
-    std::string device =
-        g_cli_camera_path.empty() ? pickAuto1080pDevice() : g_cli_camera_path;
+    bool use_stereo_sbs = !g_cli_stereo_camera_path.empty();
+    std::string device = use_stereo_sbs ? g_cli_stereo_camera_path
+                                        : (g_cli_camera_path.empty()
+                                               ? pickAuto1080pDevice()
+                                               : g_cli_camera_path);
     if (device.empty()) {
-      std::cerr << "未找到可用的 1920x1080 USB 摄像头，且未指定 --camera"
+      std::cerr << "未找到可用摄像头设备。请使用 --camera 或 --stereo-camera 指定"
                 << std::endl;
       return;
     }
+    std::cout << "采集模式: " << (use_stereo_sbs ? "stereo-sbs" : "mono-copy")
+              << "，设备: " << device << std::endl;
 
-    cv::VideoCapture cap(device);
-    if (!cap.isOpened()) {
-      std::cerr << "无法打开摄像头: " << device << std::endl;
+    cv::VideoCapture cap;
+    std::string open_err;
+    if (!openUsbCapture(device, use_stereo_sbs, fps, cap, open_err)) {
+      std::cerr << "无法打开摄像头: " << device;
+      if (!open_err.empty())
+        std::cerr << " — " << open_err;
+      std::cerr << std::endl;
       return;
     }
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-    cap.set(cv::CAP_PROP_FPS, fps);
 
     std::string pipeline_str =
         buildWebcamPipelineString(config, preview_enabled.load());
@@ -713,31 +787,40 @@ void streamingThreadFunction() {
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
-    cv::Mat frame1080;
+    cv::Mat frame;
     int frame_id = 0;
 
     std::cout << "Starting webcam streaming loop..." << std::endl;
     while (streaming_active.load() && !stop_requested.load()) {
-      if (!cap.read(frame1080) || frame1080.empty()) {
+      if (!cap.read(frame) || frame.empty()) {
         std::cerr << "read frame failed" << std::endl;
         break;
       }
 
-      cv::Mat bgra1080;
-      if (frame1080.channels() == 4) {
-        // 多数驱动在 BGRA 下已可直接使用
-        bgra1080 = frame1080;
-      } else if (frame1080.channels() == 3) {
-        cv::cvtColor(frame1080, bgra1080, cv::COLOR_BGR2BGRA);
+      cv::Mat bgra;
+      if (frame.channels() == 4) {
+        bgra = frame;
+      } else if (frame.channels() == 3) {
+        cv::cvtColor(frame, bgra, cv::COLOR_BGR2BGRA);
       } else {
-        std::cerr << "unsupported channels: " << frame1080.channels()
+        std::cerr << "unsupported channels: " << frame.channels()
                   << std::endl;
         break;
       }
 
-      // 左右同一画面拼接，模拟 ZED SIDE_BY_SIDE 供头显侧「立体」管线消费
       cv::Mat side_by_side;
-      cv::hconcat(bgra1080, bgra1080, side_by_side);
+      if (use_stereo_sbs) {
+        // 双目相机已输出 side-by-side，直接透传
+        side_by_side = bgra;
+        if (side_by_side.cols < 2 * side_by_side.rows) {
+          std::cout << "[warn] stereo-sbs 模式下输入宽高比偏小: "
+                    << side_by_side.cols << "x" << side_by_side.rows
+                    << "，请确认设备输出是否为左右拼接" << std::endl;
+        }
+      } else {
+        // 默认单目输入：复制成左右两路，模拟 ZED SIDE_BY_SIDE
+        cv::hconcat(bgra, bgra, side_by_side);
+      }
 
       cv::Mat out_bgra;
       cv::resize(side_by_side, out_bgra, cv::Size(out_w, out_h), 0, 0,
@@ -790,7 +873,7 @@ void streamingThreadFunction() {
 }
 
 // ============================================================================
-// 九、程序入口：仅支持 --listen（与 Pico 联调）；可选 --preview / --camera
+// 九、程序入口：仅支持 --listen（与 Pico 联调）；可选 --preview / --camera / --stereo-camera
 // ============================================================================
 
 int main(int argc, char *argv[]) {
@@ -809,11 +892,14 @@ int main(int argc, char *argv[]) {
       listen_address = argv[++i];
     } else if (arg == "--camera" && i + 1 < argc) {
       g_cli_camera_path = argv[++i];
+    } else if (arg == "--stereo-camera" && i + 1 < argc) {
+      g_cli_stereo_camera_path = argv[++i];
     } else if (arg == "--help") {
       std::cout << "用法: " << argv[0] << " [选项]\n";
       std::cout << "  --listen IP:PORT  必选：控制通道监听地址（Pico 连接此端口发 OPEN_CAMERA）\n";
       std::cout << "  --preview         可选：本机 GStreamer 预览窗口\n";
-      std::cout << "  --camera PATH     可选：强制使用指定设备，如 /dev/video0；不设则自动选首个 1920x1080\n";
+      std::cout << "  --camera PATH        可选：单目摄像头，程序会复制成左右路（mono-copy）\n";
+      std::cout << "  --stereo-camera PATH 可选：输入已是左右拼接(SBS)的双目相机，不复制\n";
       std::cout << "  --help            显示本帮助\n";
       std::cout << "\n说明：本二进制无 ZED SDK，用 USB 摄像头伪装 ZED 侧协议供 XRoboToolkit 使用。\n";
       return 0;

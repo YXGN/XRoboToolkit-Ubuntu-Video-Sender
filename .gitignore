@@ -1,3 +1,4 @@
 *.o
 
 OrinVideoSender
+test_v4l2_open
