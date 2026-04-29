@@ -584,10 +584,15 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
                     " ! h265parse ! appsink name=mysink emit-signals=true "
                     "sync=false ";
   } else {
-    pipeline_str += "t. ! queue ! x264enc tune=zerolatency bitrate=" +
-                    std::to_string(bitrate_kbps) +
-                    " speed-preset=ultrafast key-int-max=" +
-                    std::to_string(key_int_max) + " ! h264parse ";
+    // Pico / Android MediaCodec 硬件解码普遍只稳定支持 4:2:0（yuv420p），不支持
+    // High 4:4:4 Predictive + yuv444p。BGRA 直入 x264enc 易选 444 档，ffprobe 能解、头显白屏。
+    // 编码支路强制 I420 + profile=high，与 Jetson NVENC 常见 420 语义对齐；若仍不兼容可改 baseline。
+    pipeline_str +=
+        "t. ! queue ! videoconvert ! video/x-raw,format=I420 ! "
+        "x264enc profile=high tune=zerolatency bitrate=" +
+        std::to_string(bitrate_kbps) +
+        " speed-preset=ultrafast key-int-max=" +
+        std::to_string(key_int_max) + " ! h264parse ";
     // 实验：强制下游 caps，便于对比 Jetson 硬件码流在 MediaCodec 侧的假设（byte-stream vs avc）
     if (g_h264_out_format == "byte-stream") {
       pipeline_str +=
