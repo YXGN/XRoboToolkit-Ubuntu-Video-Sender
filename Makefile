@@ -11,12 +11,15 @@ CXX = g++
 APP := OrinVideoSender
 
 ###############################################################################
-# 默认入口（Ubuntu + Pico）：无 ZED SDK / 无 CUDA，USB 摄像头走 ZED 控制协议 --listen
-# 对应源文件：main_zed_webcam_listen.cpp
+# 默认入口（Ubuntu）：USB 摄像头 --listen（Pico）或 --send（直连 TCP）
+# main_zed_webcam.cpp + zed_webcam_{common,listen,send}.cpp
 ###############################################################################
 
 SRCS := \
-	main_zed_webcam_listen.cpp
+	main_zed_webcam.cpp \
+	zed_webcam_common.cpp \
+	zed_webcam_listen.cpp \
+	zed_webcam_send.cpp
 
 ###############################################################################
 # 备选入口（按需取消注释其一，并注释掉上方默认 SRCS）

@@ -1,11 +1,15 @@
 #include <arpa/inet.h>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <iostream>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
+#include <vector>
 
 class TCPException : public std::exception {
 private:

@@ -1,16 +1,24 @@
-# XRoboToolkit-Orin-Video-Sender
+# XRoboToolkit-Ubuntu-Video-Sender
 
 面向 **Ubuntu（无 CUDA、无 ZED SDK）** 与 **Pico XRoboToolkit** 联调的说明为主；Jetson + 真 ZED 的源码仍保留在仓库中，通过 `Makefile` 注释切换入口。
 
-## 默认构建：Pico `--listen` + USB 摄像头（伪装 ZED 协议）
+## 默认构建：USB 摄像头 `--listen`（Pico）或 `--send`（直连 TCP）
 
-默认 `make` 生成 `OrinVideoSender`，对应源文件 **`main_zed_webcam_listen.cpp`**：
+默认 `make` 生成 `OrinVideoSender`，入口为 **`main_zed_webcam.cpp`**，实现拆在 **`zed_webcam_common.cpp`**（采集与编码推流）、**`zed_webcam_listen.cpp`**（控制协议）、**`zed_webcam_send.cpp`**（直连模式）。
+
+### `--listen`（与 Pico 联调）
 
 - 在 `--listen IP:PORT` 上作为 **TCP 服务端**，接收头显发来的 **`OPEN_CAMERA` / `CLOSE_CAMERA`**（载荷格式与 `main_zed_tcp.cpp` 一致）。
 - 收到 `OPEN_CAMERA` 后，按载荷中的 **`ip` + `port`** 作为 **TCP 客户端** 连接头显视频接收端，推送 **`4 字节大端长度 + H.264（或 HEVC）`** 码流（与 ZED 版 Sender 一致）。
-- 视频来自 **USB 摄像头**：可用 `--camera /dev/videoN` 指定；否则自动选择 **编号升序下第一个能以 1920×1080 采到一帧** 的设备。
-- 将单目画面 **左右复制并排**，再缩放到 `OPEN_CAMERA` 中的宽高（BGRA），经 **GStreamer `x264enc` / `x265enc`** 软件编码。
+- 视频来自 **USB 摄像头**：可用 `--camera /dev/videoN` 指定；否则自动选择 **编号升序下第一个能以 1920×1080 采到一帧** 的设备；双目 SBS 用 **`--stereo-camera`**。
+- 将单目画面 **左右复制并排**（或 SBS 直通），再缩放到 `OPEN_CAMERA` 中的宽高（BGRA），经 **GStreamer `x264enc` / `x265enc`** 软件编码。
 - H.264 路径默认：**I420 + profile High**，且 **`h264parse` 后固定 Annex B（byte-stream）**，无需额外参数即可供 Pico 解码。
+
+### `--send`（无 Pico 控制通道）
+
+- 使用 **`--send --server IP --port PORT`**，按命令行分辨率/帧率/码率（可选 **`--hevc`**）连接接收端并推送 **相同长度前缀 + 码流** 格式。
+- 默认值与常见 Pico 请求接近：`2560x720`、`30fps`、`4000000` bps；可用 **`--width` / `--height` / `--fps` / `--bitrate`** 覆盖。
+- **`--camera` / `--stereo-camera` / `--preview`** 与 `--listen` 共用。
 
 ### 依赖（Ubuntu）
 
@@ -45,6 +53,13 @@ make
 ./OrinVideoSender --listen 0.0.0.0:13579
 # 或绑定到局域网 IP
 ./OrinVideoSender --listen 192.168.100.24:13579 --preview --camera /dev/video0
+```
+
+**直连推流示例（接收端先监听 TCP）：**
+
+```bash
+./OrinVideoSender --send --server 192.168.100.41 --port 12345 --stereo-camera /dev/video12
+# 可选：--width 2560 --height 720 --fps 30 --bitrate 4000000 --hevc
 ```
 
 头显侧按官方流程：选择 ZED 类视频源、输入 **运行 Sender 的机器 IP**、收听。首次联调请在 Sender 终端查看日志里 **`OPEN_CAMERA` 解析出的 `camera` 字符串**（可能为 `ZED`、`ZEDMINI` 等）；当前实现 **不因类型非 `ZED` 而拒绝开流**，便于兼容；确认后再考虑在代码中加白名单。
