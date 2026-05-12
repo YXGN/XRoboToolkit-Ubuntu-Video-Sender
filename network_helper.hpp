@@ -61,6 +61,15 @@ public:
       throw TCPException("Connection failed: " + std::string(strerror(error)));
     }
 
+    /* 扩大内核发送缓冲至 2 MB，让大 I 帧能快速写入内核缓冲区，
+     * 减少 appsink 回调线程因 send() 阻塞而引发的帧间隔尖峰。 */
+    int sndbuf = 2 * 1024 * 1024;
+    if (setsockopt(client_socket, SOL_SOCKET, SO_SNDBUF,
+                   &sndbuf, sizeof(sndbuf)) < 0) {
+      std::cerr << "[TCPClient] SO_SNDBUF warning: " << strerror(errno)
+                << " (继续运行)" << std::endl;
+    }
+
     connected = true;
     std::cout << "Connected to server " << server_ip << ":" << server_port
               << std::endl;

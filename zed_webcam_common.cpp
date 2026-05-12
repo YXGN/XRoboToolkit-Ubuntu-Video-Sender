@@ -122,8 +122,12 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
   int w = config.width > 0 ? config.width : 2560;
   int h = config.height > 0 ? config.height : 720;
   int bitrate_kbps = bitrateBpsToKbps(config.bitrate);
-  /* GOP 大致随帧率拉长，避免过小 IDR 间隔引起码率抖动 */
-  int key_int_max = std::max(15, fps * 2);
+  /*
+   * GOP 设为 fps*4（约 4 秒），减少 I 帧频率从而降低帧大小方差。
+   * vbv-buf-capacity 限制编码器 VBV 缓冲为 500 ms，强制近似 CBR，
+   * 防止编码器在 I 帧附近爆出大数据包堵塞 TCP 回调线程。
+   */
+  int key_int_max = std::max(30, fps * 4);
 
   std::string pipeline_str =
       "appsrc name=mysource is-live=true format=time "
@@ -141,12 +145,20 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
                     " ! h265parse ! appsink name=mysink emit-signals=true "
                     "sync=false ";
   } else {
+    /*
+     * vbv-buf-capacity=500  → VBV 缓冲上限 500 ms，强制编码器平滑输出（近似 CBR）
+     * intra-refresh=true    → 用渐进式刷新替代硬性 IDR 帧，彻底消灭帧大小尖峰；
+     *                         代价是随机 seek 困难，对实时推流无影响。
+     * option-string 中的 nal-hrd=cbr 配合 VBV 让码率控制更严格。
+     */
     pipeline_str +=
         "t. ! queue ! videoconvert ! video/x-raw,format=I420 ! "
         "x264enc profile=high tune=zerolatency bitrate=" +
         std::to_string(bitrate_kbps) +
         " speed-preset=ultrafast key-int-max=" +
         std::to_string(key_int_max) +
+        " vbv-buf-capacity=500 intra-refresh=true"
+        " option-string=\"nal-hrd=cbr\""
         " ! h264parse "
         "! video/x-h264,stream-format=(string)byte-stream,"
         "alignment=(string)au "
