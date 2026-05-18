@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-test_bitrate_monitor.py — 发送端码率稳定性测试工具
+test_bitrate_monitor.py — 发送端码率稳定性 & 画质健康度测试工具
 
 用法:
   python3 test_bitrate_monitor.py --port 9000 --window 3 --duration 60
 
-  ./OrinVideoSender --send --server 127.0.0.1 --port 9000   --width 2560 --height 720 --fps 60 --bitrate 4000000 --stereo-camera /dev/video0
+  ./OrinVideoSender --send --server 127.0.0.1 --port 9000 \
+      --width 2560 --height 720 --fps 60 --bitrate 4000000 \
+      --stereo-camera /dev/video0
 
 工作原理:
   监听指定 TCP 端口，等待 OrinVideoSender（或任何遵循
@@ -16,18 +18,15 @@ test_bitrate_monitor.py — 发送端码率稳定性测试工具
 协议格式（与 zed_webcam_common.cpp 中 on_new_sample 一致）:
   [uint32_be: payload_size][payload_size bytes: encoded AU]
 
-注：如果码率峰值对接收端（Pico 侧解码器）造成卡顿，可以在 streamingThreadFunction 里的采集循环
-加一个超时检测，跳过慢帧而不是等它：
-    // 在 while 循环里替换原来的 cap.read(frame)
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(1000 / fps * 2);  // 2 帧时间作为超时
-    if (!cap.read(frame) || frame.empty()) {
-        if (std::chrono::steady_clock::now() > deadline) {
-            std::cerr << "[warn] cap.read 超时，跳帧" << std::endl;
-            continue;  // 跳过这帧，保持管线不卡死
-        }
-        break;
-    }
+【拖影诊断说明】
+  码率稳定 ≠ 画质稳定。intra-refresh=true 配合长 GOP（fps×4）时，
+  编码器会将 I 帧刷新分散到整个 GOP 周期，快速运动场景下帧大小均匀
+  但参考块陈旧，导致局部拖影长达数秒。
+
+  本工具新增「低帧连串」检测：连续多帧帧大小低于均值的 40% 时，
+  说明编码器在大量复用旧参考块（低复杂度 P 帧），这是拖影风险的
+  直接信号。建议将 zed_webcam_common.cpp 中的 key_int_max 从
+  fps×4 缩短为 fps（1 秒 GOP），并移除 intra-refresh=true。
 
 """
 
@@ -94,10 +93,54 @@ class BitrateMonitor:
         self._total_frames = 0
         self._start_ts: float = 0.0
 
+        # 拖影风险检测：记录「低帧连串」事件 (start_ts, length_frames)
+        self._ghost_events: list = []
+        self._low_run_start: float = 0.0
+        self._low_run_len: int = 0
+        # 低帧阈值系数：帧大小低于历史均值该比例时视为"低复杂度 P 帧"
+        self._low_frame_ratio: float = 0.40
+        # 触发告警的连续低帧数
+        self._ghost_run_threshold: int = 8
+
     # ── 信号处理 ──────────────────────────────────────────────────
     def _handle_sigint(self, *_):
         print("\n[monitor] 收到 Ctrl+C，正在退出…")
         self._stop.set()
+
+    # ── 拖影风险检测（在接收线程里每帧调用）────────────────────────
+    def _check_ghost_risk(self, frame_size: int, now: float):
+        """
+        用滑动历史均值判断当前帧是否为"低复杂度 P 帧"。
+        连续超过阈值帧数时记录一次拖影风险事件并打印警告。
+        """
+        # 用最近 5 秒全部帧计算基准均值（至少需要 10 帧）
+        baseline_frames = [sz for ts, sz in self._frames
+                           if now - ts <= 5.0]
+        if len(baseline_frames) < 10:
+            return
+        baseline_avg = sum(baseline_frames) / len(baseline_frames)
+        threshold = baseline_avg * self._low_frame_ratio
+
+        if frame_size < threshold:
+            if self._low_run_len == 0:
+                self._low_run_start = now
+            self._low_run_len += 1
+            if self._low_run_len == self._ghost_run_threshold:
+                print(
+                    f"\n  ⚠  [拖影风险] 连续 {self._low_run_len} 帧帧大小"
+                    f" < {self._low_frame_ratio*100:.0f}% 均值"
+                    f"（当前 {fmt_bytes(frame_size)} vs 均值 {fmt_bytes(int(baseline_avg))}）"
+                    f" — 编码器可能在大量复用旧参考块"
+                )
+        else:
+            if self._low_run_len >= self._ghost_run_threshold:
+                duration_ms = (now - self._low_run_start) * 1000
+                self._ghost_events.append((self._low_run_start, self._low_run_len))
+                print(
+                    f"  ✓  [拖影风险解除] 低帧连串结束，持续 {duration_ms:.0f} ms"
+                    f" / {self._low_run_len} 帧\n"
+                )
+            self._low_run_len = 0
 
     # ── 统计打印线程 ──────────────────────────────────────────────
     def _print_loop(self):
@@ -126,8 +169,11 @@ class BitrateMonitor:
                 frame_max = max(recent_frames)
                 frame_avg = sum(recent_frames) / len(recent_frames)
                 frame_sd  = stddev(recent_frames)
+                # 帧大小峰谷比：反映 IDR 帧与 P 帧的大小差异
+                peak_valley_ratio = frame_max / frame_min if frame_min > 0 else 0
             else:
                 frame_min = frame_max = frame_avg = frame_sd = 0
+                peak_valley_ratio = 0
 
             # 帧率（最近 window 秒）
             fps_recent = len(recent_frames) / self.window
@@ -145,6 +191,11 @@ class BitrateMonitor:
 
             elapsed = now - self._start_ts if self._start_ts else 0
 
+            # 拖影风险状态标记
+            ghost_tag = ""
+            if self._low_run_len >= self._ghost_run_threshold:
+                ghost_tag = f"  ⚠ 低帧连串:{self._low_run_len}帧"
+
             print(
                 f"[{elapsed:6.1f}s] "
                 f"瞬时: {fmt_bps(interval_bps):>12s}  "
@@ -152,7 +203,9 @@ class BitrateMonitor:
                 f"帧率: {fps_recent:5.1f} fps  "
                 f"帧大小 avg/min/max/σ: "
                 f"{fmt_bytes(int(frame_avg))}/{fmt_bytes(frame_min)}/{fmt_bytes(frame_max)}/{fmt_bytes(int(frame_sd))}  "
+                f"峰谷比: {peak_valley_ratio:4.1f}x  "
                 f"帧间抖动σ: {jitter_ms:.1f} ms  avg间隔: {avg_gap_ms:.1f} ms"
+                f"{ghost_tag}"
             )
 
             self._sec_bytes.append((now, interval_bytes))
@@ -184,19 +237,33 @@ class BitrateMonitor:
             print(f"  逐秒码率 最大 : {fmt_bps(max(sec_bps_list))}")
             print(f"  逐秒码率 最小 : {fmt_bps(min(sec_bps_list))}")
             print(f"  逐秒码率 σ   : {fmt_bps(stddev(sec_bps_list))}")
-            cv = (stddev(sec_bps_list) / (sum(sec_bps_list)/len(sec_bps_list)) * 100
-                  if sec_bps_list else 0)
+            mean_bps = sum(sec_bps_list) / len(sec_bps_list) if sec_bps_list else 0
+            cv = (stddev(sec_bps_list) / mean_bps * 100) if mean_bps > 0 else 0
             print(f"  变异系数(CV)  : {cv:.1f}%  (越低越稳定)")
         if self._frames:
             sizes = [sz for _, sz in self._frames]
-            print(f"  帧大小 avg    : {fmt_bytes(int(sum(sizes)/len(sizes)))}")
+            avg_sz = sum(sizes) / len(sizes)
+            print(f"  帧大小 avg    : {fmt_bytes(int(avg_sz))}")
             print(f"  帧大小 σ      : {fmt_bytes(int(stddev(sizes)))}")
+            print(f"  帧大小 max/min: {fmt_bytes(max(sizes))} / {fmt_bytes(min(sizes))}"
+                  f"  峰谷比: {max(sizes)/min(sizes):.1f}x"
+                  f"  (正常 IDR+P 流: 3x~10x，intra-refresh 流: 接近 1x)")
             ts_list = sorted(t for t, _ in self._frames)
             if len(ts_list) >= 2:
                 gaps = [(ts_list[i+1]-ts_list[i])*1000 for i in range(len(ts_list)-1)]
                 print(f"  帧间隔 avg    : {sum(gaps)/len(gaps):.1f} ms")
                 print(f"  帧间隔 σ(抖动): {stddev(gaps):.1f} ms")
                 print(f"  帧间隔 最大   : {max(gaps):.1f} ms")
+        # 拖影风险事件汇总
+        print(f"\n  【拖影风险事件】共检测到 {len(self._ghost_events)} 次低帧连串")
+        if self._ghost_events:
+            for i, (ts, length) in enumerate(self._ghost_events, 1):
+                offset = ts - self._start_ts if self._start_ts else 0
+                print(f"    #{i}: t={offset:.1f}s  持续 {length} 帧")
+            print(f"  提示: 若事件频繁，请确认 zed_webcam_common.cpp 中")
+            print(f"        key_int_max=fps（非 fps*4）且已移除 intra-refresh=true")
+        else:
+            print(f"  ✓ 未检测到明显拖影风险（低帧连串 < {self._ghost_run_threshold} 帧）")
         print("=" * 70)
 
     # ── 主入口 ────────────────────────────────────────────────────
@@ -258,6 +325,7 @@ class BitrateMonitor:
                 self._total_bytes += total_frame
                 self._total_frames += 1
                 self._frames.append((now, total_frame))
+                self._check_ghost_risk(total_frame, now)
 
         except socket.timeout:
             print("[monitor] 超时：发送端超过 2 秒无数据")
