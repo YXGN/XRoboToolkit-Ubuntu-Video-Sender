@@ -1,5 +1,6 @@
 /*
  * main_zed_webcam.cpp — Ubuntu USB 摄像头入口：--listen（Pico 控制协议）或 --send（直连 TCP）。
+ * 采集：libuvc + MJPEG（对齐 teleimager uvc.Capture）。
  */
 
 #include <gst/gst.h>
@@ -24,10 +25,12 @@ static void print_usage(const char *argv0) {
   std::cout << "       --hevc           使用 HEVC（默认 H.264）\n";
   std::cout << "\n共用选项：\n";
   std::cout << "  --preview              本机 GStreamer 预览\n";
-  std::cout << "  --camera PATH          单目设备（mono-copy）\n";
-  std::cout << "  --stereo-camera PATH   双目 SBS，不复制\n";
+  std::cout << "  --stereo               双目 SBS MJPEG 采集 1856x800（不复制左右）\n";
+  std::cout << "  --uvc-uid UID          UVC 设备 uid，如 1:9（见 python uvc.device_list()）\n";
+  std::cout << "  --uvc-serial SN        UVC 设备序列号\n";
   std::cout << "  --help\n";
   std::cout << "\n说明：无 ZED SDK；码流格式与 Pico 侧一致（大端 4 字节长度 + 负载）。\n";
+  std::cout << "未指定 uid/serial 时使用第一台 UVC 设备。\n";
 }
 
 int main(int argc, char *argv[]) {
@@ -44,8 +47,9 @@ int main(int argc, char *argv[]) {
   int send_fps = 30;
   int send_bitrate = 4000000;
   bool send_hevc = false;
-  std::string mono_cam;
-  std::string stereo_cam;
+  std::string uvc_uid;
+  std::string uvc_serial;
+  bool stereo = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -70,10 +74,12 @@ int main(int argc, char *argv[]) {
       send_bitrate = std::stoi(argv[++i]);
     } else if (arg == "--hevc") {
       send_hevc = true;
-    } else if (arg == "--camera" && i + 1 < argc) {
-      mono_cam = argv[++i];
-    } else if (arg == "--stereo-camera" && i + 1 < argc) {
-      stereo_cam = argv[++i];
+    } else if (arg == "--stereo") {
+      stereo = true;
+    } else if (arg == "--uvc-uid" && i + 1 < argc) {
+      uvc_uid = argv[++i];
+    } else if (arg == "--uvc-serial" && i + 1 < argc) {
+      uvc_serial = argv[++i];
     } else if (arg == "--help") {
       print_usage(argv[0]);
       return 0;
@@ -100,7 +106,7 @@ int main(int argc, char *argv[]) {
 
   zed_webcam_install_sigint_handler();
   zed_webcam_set_preview_enabled(preview);
-  zed_webcam_set_camera_paths(mono_cam, stereo_cam);
+  zed_webcam_set_uvc_options(uvc_uid, uvc_serial, stereo);
 
   if (listen_mode) {
     run_listen_mode(listen_addr);

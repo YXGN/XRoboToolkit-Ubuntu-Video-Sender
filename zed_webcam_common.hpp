@@ -6,6 +6,7 @@
  *
  * Ubuntu USB 摄像头推流的共享声明：全局配置、线程安全的状态、TCP 发送端，
  * 以及与 listen/send 模式共用的采集→编码→打包发送入口。
+ * 采集使用 libuvc + MJPEG（对齐 teleimager uvc.Capture）。
  * 实现见 zed_webcam_common.cpp；listen 专用 TCPServer 在 zed_webcam_listen.cpp。
  */
 
@@ -57,9 +58,10 @@ extern std::unique_ptr<TCPClient> sender_ptr;
 extern std::string send_to_server;
 extern int send_to_port;
 
-/* 命令行传入：空表示走默认（单目自动探测 / 无双目设备） */
-extern std::string g_cli_camera_path;
-extern std::string g_cli_stereo_camera_path;
+/* UVC 采集 CLI（libuvc，非 /dev/video*） */
+extern std::string g_cli_uvc_uid;
+extern std::string g_cli_uvc_serial;
+extern bool g_cli_stereo_mode;
 
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_helper(Args &&...args) {
@@ -71,8 +73,8 @@ void zed_webcam_install_sigint_handler();
 
 void zed_webcam_set_preview_enabled(bool v);
 
-void zed_webcam_set_camera_paths(const std::string &mono,
-                                 const std::string &stereo);
+void zed_webcam_set_uvc_options(const std::string &uid, const std::string &serial,
+                                bool stereo);
 
 /* 按 send_to_server/send_to_port 建立视频 TCP，失败重试至多约 10 次 */
 bool initialize_sender();
@@ -81,7 +83,7 @@ void startStreamingThread();
 
 void stopStreamingThread();
 
-/* 单实例推流线程主体：连接 → OpenCV 采集 → appsrc → GStreamer 编码 → TCP */
+/* 单实例推流线程主体：连接 → libuvc 采集 → appsrc → GStreamer 编码 → TCP */
 void streamingThreadFunction();
 
 /* 定义于 zed_webcam_listen.cpp：停止 Pico 控制口 TCPServer；send 模式未创建服务端则无副作用 */

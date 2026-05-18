@@ -17,6 +17,7 @@ APP := OrinVideoSender
 
 SRCS := \
 	main_zed_webcam.cpp \
+	uvc_camera_source.cpp \
 	zed_webcam_common.cpp \
 	zed_webcam_listen.cpp \
 	zed_webcam_send.cpp
@@ -56,7 +57,8 @@ CPPFLAGS := -std=c++11 \
 	-I./asio-1.30.2/include \
 	-I/usr/include/opencv4 \
 	$(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 glib-2.0 2>/dev/null || echo "") \
-	$(shell pkg-config --cflags libzmq 2>/dev/null || echo "")
+	$(shell pkg-config --cflags libzmq libuvc 2>/dev/null || echo "") \
+	$(shell pkg-config --cflags libusb-1.0 2>/dev/null || echo "")
 
 # Compiler flags
 CXXFLAGS := -Wall -Wextra -O2 -g
@@ -80,6 +82,8 @@ LDFLAGS += -lopencv_core -lopencv_imgproc -lopencv_videoio -lopencv_imgcodecs \
 LDFLAGS += $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 glib-2.0 2>/dev/null || echo "-lgstreamer-1.0 -lgstapp-1.0 -lglib-2.0")
 
 LDFLAGS += $(shell pkg-config --libs libzmq 2>/dev/null || echo "-lzmq")
+
+LDFLAGS += $(shell pkg-config --libs libuvc libusb-1.0 2>/dev/null || echo "-luvc -lusb-1.0")
 
 all: $(APP)
 

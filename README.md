@@ -10,7 +10,7 @@
 
 - 在 `--listen IP:PORT` 上作为 **TCP 服务端**，接收头显发来的 **`OPEN_CAMERA` / `CLOSE_CAMERA`**（载荷格式与 `main_zed_tcp.cpp` 一致）。
 - 收到 `OPEN_CAMERA` 后，按载荷中的 **`ip` + `port`** 作为 **TCP 客户端** 连接头显视频接收端，推送 **`4 字节大端长度 + H.264（或 HEVC）`** 码流（与 ZED 版 Sender 一致）。
-- 视频来自 **USB 摄像头**：可用 `--camera /dev/videoN` 指定；否则自动选择 **编号升序下第一个能以 1920×1080 采到一帧** 的设备；双目 SBS 用 **`--stereo-camera`**。
+- 视频来自 **USB 摄像头（libuvc + MJPEG）**，对齐 xr_teleoperate teleimager 的 `uvc.Capture(uid)`；不依赖 `/dev/video*`。用 **`--uvc-uid`** / **`--uvc-serial`** 指定设备，未指定则用第一台 UVC；双目 SBS 加 **`--stereo`**（采集 1856×800 MJPEG）。
 - 将单目画面 **左右复制并排**（或 SBS 直通），再缩放到 `OPEN_CAMERA` 中的宽高（BGRA），经 **GStreamer `x264enc` / `x265enc`** 软件编码。
 - H.264 路径默认：**I420 + profile High**，且 **`h264parse` 后固定 Annex B（byte-stream）**，无需额外参数即可供 Pico 解码。
 
@@ -18,7 +18,7 @@
 
 - 使用 **`--send --server IP --port PORT`**，按命令行分辨率/帧率/码率（可选 **`--hevc`**）连接接收端并推送 **相同长度前缀 + 码流** 格式。
 - 默认值与常见 Pico 请求接近：`2560x720`、`30fps`、`4000000` bps；可用 **`--width` / `--height` / `--fps` / `--bitrate`** 覆盖。
-- **`--camera` / `--stereo-camera` / `--preview`** 与 `--listen` 共用。
+- **`--uvc-uid` / `--uvc-serial` / `--stereo` / `--preview`** 与 `--listen` 共用。
 
 ### 依赖（Ubuntu）
 
@@ -30,6 +30,7 @@ sudo apt-get install -y \
   gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
   libopencv-dev libssl-dev libzmq3-dev \
+  libuvc-dev libusb-1.0-0-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev
 ```
 
@@ -47,18 +48,24 @@ make
 ./OrinVideoSender --help
 ```
 
-**供 Pico 联调（示例：本机监听 13579，可选本机预览与指定摄像头）：**
+**在 PC2 上发现 UVC 设备 uid（与 teleimager 一致）：**
+
+```bash
+python3 -c "import uvc; print(uvc.device_list())"
+```
+
+**供 Pico 联调（示例：本机监听 13579，双目 + 序列号）：**
 
 ```bash
 ./OrinVideoSender --listen 0.0.0.0:13579
 # 或绑定到局域网 IP
-./OrinVideoSender --listen 192.168.100.24:13579 --preview --camera /dev/video0
+./OrinVideoSender --listen 192.168.123.164:13579 --preview --stereo --uvc-serial 01.00.00
 ```
 
 **直连推流示例（接收端先监听 TCP）：**
 
 ```bash
-./OrinVideoSender --send --server 192.168.100.41 --port 12345 --stereo-camera /dev/video12
+./OrinVideoSender --send --server 192.168.100.41 --port 12345 --stereo --uvc-uid 1:9
 # 可选：--width 2560 --height 720 --fps 30 --bitrate 4000000 --hevc
 ```
 

@@ -1,25 +1,24 @@
 /*
  * zed_webcam_common.cpp
  *
- * 实现 USB 摄像头 → BGRA →（可选预览分支）→ x264/x265 → appsink → TCP 封包。
+ * 实现 USB 摄像头（libuvc MJPEG）→ BGRA →（可选预览）→ x264/x265 → appsink → TCP。
  * --listen 与 --send 仅在「谁写入 current_camera_config / send_to_*」上不同，
  * 推流路径统一为本文件中的 streamingThreadFunction。
  */
 
 #include "zed_webcam_common.hpp"
+#include "uvc_camera_source.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstring>
 #include <vector>
-#include <errno.h>
-#include <fcntl.h>
-#include <glob.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 #include <iostream>
+#include <thread>
 #include <opencv2/opencv.hpp>
 
 /* ========== 全局状态（与 listen/send 共享）========== */
@@ -40,8 +39,9 @@ std::unique_ptr<TCPClient> sender_ptr;
 std::string send_to_server;
 int send_to_port = 0;
 
-std::string g_cli_camera_path;
-std::string g_cli_stereo_camera_path;
+std::string g_cli_uvc_uid;
+std::string g_cli_uvc_serial;
+bool g_cli_stereo_mode = false;
 
 namespace {
 
@@ -175,136 +175,6 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
   return pipeline_str;
 }
 
-/* 探测某 /dev/video 节点能否以 1920×1080 实际采到一帧（用于单目自动选型） */
-static bool probe1080pDevice(const std::string &device_path, std::string &err) {
-  cv::VideoCapture cap(device_path);
-  if (!cap.isOpened()) {
-    err = "无法打开";
-    return false;
-  }
-  cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-  cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-  cv::Mat frame;
-  if (!cap.read(frame) || frame.empty()) {
-    err = "read 失败";
-    cap.release();
-    return false;
-  }
-  int w = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-  int h = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-  if (frame.cols != 1920 || frame.rows != 1080) {
-    err = "实际分辨率 " + std::to_string(frame.cols) + "x" +
-          std::to_string(frame.rows);
-    cap.release();
-    return false;
-  }
-  if (w != 1920 || h != 1080) {
-    err = "属性报告 " + std::to_string(w) + "x" + std::to_string(h);
-    cap.release();
-    return false;
-  }
-  cap.release();
-  err.clear();
-  return true;
-}
-
-/* 按 /dev/video 编号升序，取第一个通过 probe1080pDevice 的设备 */
-static std::string pickAuto1080pDevice() {
-  glob_t gbuf;
-  memset(&gbuf, 0, sizeof(gbuf));
-  if (glob("/dev/video*", 0, nullptr, &gbuf) != 0) {
-    std::cerr << "glob /dev/video* 失败: " << strerror(errno) << std::endl;
-    return std::string();
-  }
-
-  std::vector<std::pair<int, std::string>> numbered;
-  for (size_t i = 0; i < gbuf.gl_pathc; ++i) {
-    std::string p = gbuf.gl_pathv[i];
-    int n = -1;
-    if (std::sscanf(p.c_str(), "/dev/video%d", &n) != 1)
-      continue;
-    numbered.push_back(std::make_pair(n, p));
-  }
-  globfree(&gbuf);
-  std::sort(numbered.begin(), numbered.end());
-
-  for (const auto &pr : numbered) {
-    std::string err;
-    if (probe1080pDevice(pr.second, err)) {
-      std::cout << "自动选中摄像头: " << pr.second << " (1920x1080)" << std::endl;
-      return pr.second;
-    } else {
-      std::cout << "跳过 " << pr.second << " : " << err << std::endl;
-    }
-  }
-  return std::string();
-}
-
-/* 常见双目 MJPEG SBS 模式的采集分辨率（与 v4l2 枚举一致） */
-static constexpr int kStereoSbsCaptureWidth = 1856;
-static constexpr int kStereoSbsCaptureHeight = 800;
-
-/*
- * 打开 V4L2 摄像头：优先 CAP_V4L2，避免与其他 GStreamer 进程争用默认后端。
- * stereo_sbs：MJPEG + 固定宽高；否则单目 1920×1080。fps 与编码管线一致，用于驱动侧协商。
- */
-static bool openUsbCapture(const std::string &device, bool stereo_sbs, int fps,
-                           cv::VideoCapture &cap, std::string &err_detail) {
-  err_detail.clear();
-
-  auto configure = [&](cv::VideoCapture &c) -> bool {
-    if (!c.isOpened())
-      return false;
-    if (stereo_sbs) {
-      c.set(cv::CAP_PROP_FOURCC,
-            cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-      c.set(cv::CAP_PROP_FRAME_WIDTH, kStereoSbsCaptureWidth);
-      c.set(cv::CAP_PROP_FRAME_HEIGHT, kStereoSbsCaptureHeight);
-    } else {
-      c.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-      c.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-    }
-    c.set(cv::CAP_PROP_FPS, fps);
-    return true;
-  };
-
-  cv::VideoCapture tmp;
-
-  int vid = -1;
-  if (std::sscanf(device.c_str(), "/dev/video%d", &vid) == 1 && vid >= 0) {
-    tmp.open(vid, cv::CAP_V4L2);
-    if (configure(tmp)) {
-      cap = std::move(tmp);
-      return true;
-    }
-    tmp.release();
-  }
-
-  tmp.open(device, cv::CAP_V4L2);
-  if (configure(tmp)) {
-    cap = std::move(tmp);
-    return true;
-  }
-  tmp.release();
-
-  tmp.open(device);
-  if (configure(tmp)) {
-    cap = std::move(tmp);
-    return true;
-  }
-  tmp.release();
-
-  int fd = ::open(device.c_str(), O_RDWR | O_NONBLOCK);
-  if (fd < 0) {
-    err_detail = strerror(errno);
-  } else {
-    ::close(fd);
-    err_detail =
-        "OpenCV 仍未打开（底层节点可读）；若需独占请先关掉其它取流进程";
-  }
-  return false;
-}
-
 } // namespace
 
 void zed_webcam_install_sigint_handler() {
@@ -313,10 +183,11 @@ void zed_webcam_install_sigint_handler() {
 
 void zed_webcam_set_preview_enabled(bool v) { preview_enabled.store(v); }
 
-void zed_webcam_set_camera_paths(const std::string &mono,
-                                 const std::string &stereo) {
-  g_cli_camera_path = mono;
-  g_cli_stereo_camera_path = stereo;
+void zed_webcam_set_uvc_options(const std::string &uid, const std::string &serial,
+                                bool stereo) {
+  g_cli_uvc_uid = uid;
+  g_cli_uvc_serial = serial;
+  g_cli_stereo_mode = stereo;
 }
 
 bool initialize_sender() {
@@ -375,9 +246,9 @@ void stopStreamingThread() {
  * 推流线程（与主线程、GStreamer 回调线程并发）：
  *  1) TCP 连接接收端
  *  2) 拷贝一份 current_camera_config，确定输出宽高 fps
- *  3) 选择设备：stereo 路径或单目路径（CLI 或自动 1080p）
- *  4) openUsbCapture + parse_launch + PLAYING
- *  5) 循环：read → BGRA →（单目则左右复制）→ resize → 写 PTS/DURATION → appsrc push
+ *  3) libuvc 打开相机（uid/serial，MJPEG）
+ *  4) parse_launch + PLAYING
+ *  5) 循环：readBgr → BGRA →（单目则左右复制）→ resize → appsrc push
  * h264parse 配置为 AU 对齐，故 appsink 单次回调对应一块可独立解码的负载。
  */
 void streamingThreadFunction() {
@@ -403,26 +274,25 @@ void streamingThreadFunction() {
     int out_h = config.height > 0 ? config.height : 720;
     int fps = config.fps > 0 ? config.fps : 30;
 
-    bool use_stereo_sbs = !g_cli_stereo_camera_path.empty();
-    std::string device = use_stereo_sbs ? g_cli_stereo_camera_path
-                                        : (g_cli_camera_path.empty()
-                                               ? pickAuto1080pDevice()
-                                               : g_cli_camera_path);
-    if (device.empty()) {
-      std::cerr << "未找到可用摄像头设备。请使用 --camera 或 --stereo-camera 指定"
-                << std::endl;
-      return;
-    }
+    bool use_stereo_sbs = g_cli_stereo_mode;
     std::cout << "采集模式: " << (use_stereo_sbs ? "stereo-sbs" : "mono-copy")
-              << "，设备: " << device << std::endl;
+              << " (libuvc MJPEG)";
+    if (!g_cli_uvc_uid.empty())
+      std::cout << " uid=" << g_cli_uvc_uid;
+    if (!g_cli_uvc_serial.empty())
+      std::cout << " serial=" << g_cli_uvc_serial;
+    std::cout << std::endl;
 
-    cv::VideoCapture cap;
+    UvcCameraSource uvc_cam;
     std::string open_err;
-    if (!openUsbCapture(device, use_stereo_sbs, fps, cap, open_err)) {
-      std::cerr << "无法打开摄像头: " << device;
+    if (!uvc_cam.open(g_cli_uvc_uid, g_cli_uvc_serial, use_stereo_sbs, fps,
+                      open_err)) {
+      std::cerr << "无法打开 UVC 摄像头";
       if (!open_err.empty())
-        std::cerr << " — " << open_err;
+        std::cerr << ": " << open_err;
       std::cerr << std::endl;
+      std::cerr << "提示: python3 -c \"import uvc; print(uvc.device_list())\""
+                << std::endl;
       return;
     }
 
@@ -460,21 +330,13 @@ void streamingThreadFunction() {
 
     std::cout << "Starting webcam streaming loop..." << std::endl;
     while (streaming_active.load() && !stop_requested.load()) {
-      if (!cap.read(frame) || frame.empty()) {
+      if (!uvc_cam.readBgr(frame) || frame.empty()) {
         std::cerr << "read frame failed" << std::endl;
         break;
       }
 
       cv::Mat bgra;
-      if (frame.channels() == 4) {
-        bgra = frame;
-      } else if (frame.channels() == 3) {
-        cv::cvtColor(frame, bgra, cv::COLOR_BGR2BGRA);
-      } else {
-        std::cerr << "unsupported channels: " << frame.channels()
-                  << std::endl;
-        break;
-      }
+      cv::cvtColor(frame, bgra, cv::COLOR_BGR2BGRA);
 
       cv::Mat side_by_side;
       if (use_stereo_sbs) {
@@ -532,7 +394,7 @@ void streamingThreadFunction() {
     gst_object_unref(appsrc);
     gst_object_unref(appsink);
     gst_object_unref(pipeline);
-    cap.release();
+    uvc_cam.close();
 
   } catch (const std::exception &e) {
     std::cerr << "Streaming thread error: " << e.what() << std::endl;
