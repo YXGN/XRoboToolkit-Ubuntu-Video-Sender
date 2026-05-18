@@ -9,11 +9,11 @@
 
 #include <opencv2/core.hpp>
 
-/* 双目 SBS 候选（按优先级） */
-constexpr int kUvcStereoPrefer1W = 3840;
-constexpr int kUvcStereoPrefer1H = 1080;
-constexpr int kUvcStereoPrefer2W = 2560;
-constexpr int kUvcStereoPrefer2H = 720;
+/* 双目 SBS 候选（按优先级，与 Pico OPEN_CAMERA 2560×720 对齐） */
+constexpr int kUvcStereoPrefer1W = 2560;
+constexpr int kUvcStereoPrefer1H = 720;
+constexpr int kUvcStereoPrefer2W = 3840;
+constexpr int kUvcStereoPrefer2H = 1080;
 /* 单目首选 */
 constexpr int kUvcMonoPreferW = 1920;
 constexpr int kUvcMonoPreferH = 1080;

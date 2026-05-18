@@ -25,8 +25,8 @@ static void print_usage(const char *argv0) {
   std::cout << "       --hevc           使用 HEVC（默认 H.264）\n";
   std::cout << "\n共用选项：\n";
   std::cout << "  --preview              本机 GStreamer 预览\n";
-  std::cout << "  --stereo               双目 SBS MJPEG 采集 1856x800（不复制左右）\n";
-  std::cout << "  --uvc-uid UID          UVC 设备 uid，如 1:9（见 python uvc.device_list()）\n";
+  std::cout << "  --stereo               双目 SBS MJPEG（优先 2560×720，回落 3840×1080）\n";
+  std::cout << "  --uvc-uid UID          UVC 设备 uid，如 1:4（见 python uvc.device_list()）\n";
   std::cout << "  --uvc-serial SN        UVC 设备序列号\n";
   std::cout << "  --help\n";
   std::cout << "\n说明：无 ZED SDK；码流格式与 Pico 侧一致（大端 4 字节长度 + 负载）。\n";

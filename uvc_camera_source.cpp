@@ -134,7 +134,7 @@ bool UvcCameraSource::findStreamCtrl(bool stereo_sbs, int fps,
       return true;
     if (tryMjpegMode(kUvcStereoPrefer2W, kUvcStereoPrefer2H, prefer_fps, ctrl))
       return true;
-    err_detail = "no stereo MJPEG (tried 3840x1080, 2560x720)";
+    err_detail = "no stereo MJPEG (tried 2560x720, 3840x1080)";
     return false;
   }
 
