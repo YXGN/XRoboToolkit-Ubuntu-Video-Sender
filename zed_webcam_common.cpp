@@ -8,6 +8,7 @@
 
 #include "zed_webcam_common.hpp"
 #include "uvc_camera_source.hpp"
+#include "latency_tracker.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -63,6 +64,11 @@ static void zed_webcam_on_sigint(int) {
  * 与 main_zed_tcp / Pico 接收侧约定一致。
  */
 static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer /*user_data*/) {
+  /* T6：GStreamer 编码线程触发本回调的时刻 */
+  const int64_t t6 = lat_now_ns();
+  /* T5：从原子变量读取上一次 appsrc push 完成的时刻，用于计算编码耗时 */
+  const int64_t t5 = LatencyTracker::get().last_push_ns.load();
+
   GstSample *sample = gst_app_sink_pull_sample(sink);
   if (!sample)
     return GST_FLOW_ERROR;
@@ -84,6 +90,12 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer /*user_data*/) {
         std::copy(data, data + size, packet.begin() + 4);
 
         sender_ptr->sendData(packet);
+
+        /* T7：TCP 发送完成（含阻塞等待） */
+        const int64_t t7 = lat_now_ns();
+        if (t5 > 0) {
+          LatencyTracker::get().add_encode_send(t5, t6, t7);
+        }
       } catch (const TCPException &e) {
         std::cerr << "TCP error in on_new_sample: " << e.what() << std::endl;
         streaming_active.store(false);
@@ -330,7 +342,9 @@ void streamingThreadFunction() {
 
     std::cout << "Starting webcam streaming loop..." << std::endl;
     while (streaming_active.load() && !stop_requested.load()) {
-      if (!uvc_cam.readBgr(frame) || frame.empty()) {
+      /* 读帧，同时收集 T1/T2/T3 */
+      int64_t t1 = 0, t2 = 0, t3 = 0;
+      if (!uvc_cam.readBgr(frame, &t1, &t2, &t3) || frame.empty()) {
         std::cerr << "read frame failed" << std::endl;
         break;
       }
@@ -356,6 +370,9 @@ void streamingThreadFunction() {
       cv::resize(side_by_side, out_bgra, cv::Size(out_w, out_h), 0, 0,
                  cv::INTER_LINEAR);
 
+      /* T4：resize 完成 */
+      const int64_t t4 = lat_now_ns();
+
       if (!encoding_enabled.load())
         break;
 
@@ -379,6 +396,18 @@ void streamingThreadFunction() {
 
       GstFlowReturn ret =
           gst_app_src_push_buffer(GST_APP_SRC(appsrc), buffer);
+
+      /* T5：appsrc push 返回（若 queue 满/阻塞，此处耗时会显著增大） */
+      const int64_t t5 = lat_now_ns();
+
+      /* 向 on_new_sample 线程传递 T5，供计算编码耗时（T6-T5） */
+      LatencyTracker::get().last_push_ns.store(t5);
+
+      /* 记录采集侧各阶段延迟（T1 有效则上报，否则跳过首帧） */
+      if (t1 > 0) {
+        LatencyTracker::get().add_capture(t1, t2, t3, t4, t5);
+      }
+
       if (ret != GST_FLOW_OK) {
         std::cerr << "appsrc push failed: " << ret << std::endl;
         break;

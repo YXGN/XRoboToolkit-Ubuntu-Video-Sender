@@ -1,4 +1,5 @@
 #include "uvc_camera_source.hpp"
+#include "latency_tracker.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -271,24 +272,40 @@ void UvcCameraSource::frameCallback(uvc_frame_t *frame, void *user_ptr) {
   if (frame->frame_format != UVC_FRAME_FORMAT_MJPEG)
     return;
 
+  /* T1：libuvc 回调收到帧的时刻（在持锁前记录，避免被锁等待时间污染） */
+  const int64_t t1 = lat_now_ns();
+
   std::lock_guard<std::mutex> lock(self->frame_mutex_);
+  self->latest_frame_time_ns_ = t1;
   self->latest_jpeg_.assign(static_cast<uint8_t *>(frame->data),
                             static_cast<uint8_t *>(frame->data) +
                                 frame->data_bytes);
   self->has_frame_ = true;
 }
 
-bool UvcCameraSource::readBgr(cv::Mat &bgr) {
+bool UvcCameraSource::readBgr(cv::Mat &bgr,
+                               int64_t *t1_ns,
+                               int64_t *t2_ns,
+                               int64_t *t3_ns) {
   std::vector<uint8_t> jpeg_copy;
   {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     if (!has_frame_ || latest_jpeg_.empty())
       return false;
+    /* T1：该帧被 frameCallback 采集到的时刻 */
+    if (t1_ns) *t1_ns = latest_frame_time_ns_;
     jpeg_copy = latest_jpeg_;
   }
 
+  /* T2：已读完 latest_jpeg_，锁已释放 */
+  if (t2_ns) *t2_ns = lat_now_ns();
+
   cv::Mat buf(1, static_cast<int>(jpeg_copy.size()), CV_8UC1, jpeg_copy.data());
   bgr = cv::imdecode(buf, cv::IMREAD_COLOR);
+
+  /* T3：JPEG 解码完成 */
+  if (t3_ns) *t3_ns = lat_now_ns();
+
   return !bgr.empty();
 }
 
