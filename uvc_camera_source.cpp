@@ -275,12 +275,16 @@ void UvcCameraSource::frameCallback(uvc_frame_t *frame, void *user_ptr) {
   /* T1：libuvc 回调收到帧的时刻（在持锁前记录，避免被锁等待时间污染） */
   const int64_t t1 = lat_now_ns();
 
-  std::lock_guard<std::mutex> lock(self->frame_mutex_);
-  self->latest_frame_time_ns_ = t1;
-  self->latest_jpeg_.assign(static_cast<uint8_t *>(frame->data),
-                            static_cast<uint8_t *>(frame->data) +
-                                frame->data_bytes);
-  self->has_frame_ = true;
+  {
+    std::lock_guard<std::mutex> lock(self->frame_mutex_);
+    self->latest_frame_time_ns_ = t1;
+    self->latest_jpeg_.assign(static_cast<uint8_t *>(frame->data),
+                              static_cast<uint8_t *>(frame->data) +
+                                  frame->data_bytes);
+    self->has_frame_ = true;
+    self->frame_seq_++;          /* 序号递增，供 waitNewFrame 检测新帧 */
+  }
+  self->frame_cv_.notify_one(); /* 通知 streaming loop 有新帧可读 */
 }
 
 bool UvcCameraSource::readBgr(cv::Mat &bgr,
@@ -307,6 +311,17 @@ bool UvcCameraSource::readBgr(cv::Mat &bgr,
   if (t3_ns) *t3_ns = lat_now_ns();
 
   return !bgr.empty();
+}
+
+bool UvcCameraSource::waitNewFrame(uint64_t &last_seq, int timeout_ms) {
+  std::unique_lock<std::mutex> lk(frame_mutex_);
+  bool arrived = frame_cv_.wait_for(
+      lk,
+      std::chrono::milliseconds(timeout_ms),
+      [this, &last_seq] { return frame_seq_ != last_seq; });
+  if (arrived)
+    last_seq = frame_seq_;
+  return arrived;
 }
 
 void UvcCameraSource::close() {

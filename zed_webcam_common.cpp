@@ -150,8 +150,23 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
 
   pipeline_str += "videoconvert ! tee name=t ";
 
+  /*
+   * 低延迟队列参数（三处 queue 统一）：
+   *   max-size-buffers=1   队列最多缓存 1 帧
+   *   max-size-time=0      不按时间限制（由 buffers 控制）
+   *   max-size-bytes=0     不按字节限制（由 buffers 控制）
+   *   leaky=downstream     队列满时丢掉最旧帧（downstream 端），接收最新帧
+   *
+   * 效果：appsrc 快于编码器时，编码器始终拿到最新帧，不会出现帧堆积。
+   * 代价：丢弃的帧不会被编码，接收端帧率可能低于相机帧率，但延迟保持恒定。
+   */
+  static const char *kLowLatQueue =
+      "queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 "
+      "leaky=downstream ";
+
   if (config.enableMvHevc) {
-    pipeline_str += "t. ! queue ! x265enc tune=zerolatency bitrate=" +
+    pipeline_str += std::string("t. ! ") + kLowLatQueue +
+                    "! x265enc tune=zerolatency bitrate=" +
                     std::to_string(bitrate_kbps) +
                     " speed-preset=ultrafast key-int-max=" +
                     std::to_string(key_int_max) +
@@ -165,8 +180,8 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
      *                         代价：I 帧帧大小略高于 P 帧，但 VBV 限制可抑制突刺。
      * option-string 中的 nal-hrd=cbr 配合 VBV 让码率控制更严格。
      */
-    pipeline_str +=
-        "t. ! queue ! videoconvert ! video/x-raw,format=I420 ! "
+    pipeline_str += std::string("t. ! ") + kLowLatQueue +
+        "! videoconvert ! video/x-raw,format=I420 ! "
         "x264enc profile=high tune=zerolatency bitrate=" +
         std::to_string(bitrate_kbps) +
         " speed-preset=ultrafast key-int-max=" +
@@ -180,8 +195,8 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
   }
 
   if (preview) {
-    pipeline_str +=
-        "t. ! queue ! videoconvert ! autovideosink sync=false ";
+    pipeline_str += std::string("t. ! ") + kLowLatQueue +
+        "! videoconvert ! autovideosink sync=false ";
   }
 
   return pipeline_str;
@@ -339,9 +354,15 @@ void streamingThreadFunction() {
 
     cv::Mat frame;
     int frame_id = 0;
+    uint64_t frame_seq = 0; /* 上一次处理的帧序号，配合 waitNewFrame 避免重复处理 */
 
     std::cout << "Starting webcam streaming loop..." << std::endl;
     while (streaming_active.load() && !stop_requested.load()) {
+      /* 等待 libuvc 回调推送新帧（最多 200ms），超时则重新检查 stop 标志 */
+      if (!uvc_cam.waitNewFrame(frame_seq, 200)) {
+        continue; /* 超时：可能相机掉线或帧率很低，继续循环检查停止信号 */
+      }
+
       /* 读帧，同时收集 T1/T2/T3 */
       int64_t t1 = 0, t2 = 0, t3 = 0;
       if (!uvc_cam.readBgr(frame, &t1, &t2, &t3) || frame.empty()) {
