@@ -155,18 +155,30 @@ python3 -c "import uvc; print(uvc.device_list())"
 
 **与 teleimager 共存**：同一台 PC2 上 **不能** 同时由 teleimager 与本 Sender 打开同一支 UVC 相机；联调 Sender 前请停止 teleimager 服务。
 
-**Python 快速验证相机模式（与 C++ 对齐）**
+**Python 快速验证相机（与 C++ / teleimager 对齐）**
 
 ```bash
-python3 -c "
-import uvc, cv2
-cap = uvc.Capture('1:4')          # 改为你的 uid
-cap.frame_mode = (2560, 720, 60, 'MJPG')
-for i in range(10):
-    f = cap.get_frame_robust()
-    img = cv2.imdecode(f, cv2.IMREAD_COLOR)
-    print(i, None if img is None else img.shape)
-"
+python3 test_head_camera_stereo_overlap.py --source uvc --uvc-serial 01.00.00 --out capture
+```
+
+### 测试：头部相机抓帧 + 双目重叠
+
+对 SBS 画面做左右切分并 50% 叠加（与 ffmpeg `blend` 一致）。**采集与 OrinVideoSender 相同：C++ `UvcCameraSource`（libuvc）**，不要用 Python `pyuvc`（易出现 `Mode not supported`）。
+
+```bash
+make test-stereo   # 生成 test_stereo_capture
+
+# 推荐：与 Sender 相同 libuvc 路径
+./test_stereo_capture --uvc-serial 01.00.00 --out capture
+# 或
+python3 test_head_camera_stereo_overlap.py --source uvc --uvc-serial 01.00.00 --out capture
+
+# 开发机有 /dev/video0
+python3 test_head_camera_stereo_overlap.py --source v4l2 --device /dev/video0 --out capture
+
+# Go2 内置相机（G1 通常 code=3102 失败）
+pip install unitree_sdk2py
+python3 test_head_camera_stereo_overlap.py --source sdk eth0 --out sdk_capture
 ```
 
 ---

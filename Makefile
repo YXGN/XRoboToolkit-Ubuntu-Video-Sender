@@ -85,7 +85,24 @@ LDFLAGS += $(shell pkg-config --libs libzmq 2>/dev/null || echo "-lzmq")
 
 LDFLAGS += $(shell pkg-config --libs libuvc libusb-1.0 2>/dev/null || echo "-luvc -lusb-1.0")
 
+# 与 OrinVideoSender 相同 libuvc 路径的抓帧测试（不链 GStreamer/ZMQ）
+TEST_STEREO := test_stereo_capture
+TEST_STEREO_OBJS := test_stereo_capture.o uvc_camera_source.o
+TEST_LDFLAGS := -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lpthread \
+	-lstdc++ \
+	$(shell pkg-config --libs libuvc libusb-1.0 2>/dev/null || echo "-luvc -lusb-1.0")
+
 all: $(APP)
+
+test-stereo: $(TEST_STEREO)
+
+$(TEST_STEREO): $(TEST_STEREO_OBJS)
+	@echo "Linking: $@"
+	$(CXX) -o $@ $(TEST_STEREO_OBJS) $(TEST_LDFLAGS)
+
+test_stereo_capture.o: test_stereo_capture.cpp uvc_camera_source.hpp
+	@echo "Compiling: $<"
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 debug: CXXFLAGS += -DDEBUG -g3 -O0
 debug: $(APP)
@@ -99,10 +116,10 @@ $(APP): $(OBJS)
 	$(CXX) -o $@ $(OBJS) $(LDFLAGS)
 
 clean:
-	rm -rf $(APP) $(OBJS)
+	rm -rf $(APP) $(OBJS) $(TEST_STEREO) $(TEST_STEREO_OBJS)
 
 install: $(APP)
 	@echo "Installing $(APP)..."
 	install -D $(APP) /usr/local/bin/$(APP)
 
-.PHONY: all debug clean install
+.PHONY: all debug clean install test-stereo
