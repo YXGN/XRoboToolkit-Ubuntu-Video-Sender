@@ -299,6 +299,9 @@ bool UvcCameraSource::readBgr(cv::Mat &bgr,
     /* T1：该帧被 frameCallback 采集到的时刻 */
     if (t1_ns) *t1_ns = latest_frame_time_ns_;
     jpeg_copy = latest_jpeg_;
+    /* 标记帧已消费：防止调用方在没有 waitNewFrame 保护时重复读取同一帧。
+     * waitNewFrame + frame_seq_ 已从调用侧保证了 1:1 处理，这里是第二道防线。*/
+    has_frame_ = false;
   }
 
   /* T2：已读完 latest_jpeg_，锁已释放 */
