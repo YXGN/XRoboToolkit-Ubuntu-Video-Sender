@@ -19,7 +19,8 @@ SRCS := \
 	main_zed_webcam.cpp \
 	zed_webcam_common.cpp \
 	zed_webcam_listen.cpp \
-	zed_webcam_send.cpp
+	zed_webcam_send.cpp \
+	webcam_capture_source.cpp
 
 ###############################################################################
 # 备选入口（按需取消注释其一，并注释掉上方默认 SRCS）
