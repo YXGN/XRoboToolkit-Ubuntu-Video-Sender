@@ -26,6 +26,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <cstdint>
 #include <vector>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -58,6 +59,72 @@ namespace {
 
 /* 推流工作线程句柄；由 streaming_mutex 保护创建与 join */
 std::unique_ptr<std::thread> streaming_thread;
+std::atomic<uint64_t> transport_frame_sequence{0};
+
+static int64_t GetUnixTimeMicroseconds() {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(
+               system_clock::now().time_since_epoch())
+        .count();
+}
+
+static void WriteLe16(uint8_t *dst, uint16_t value) {
+    dst[0] = static_cast<uint8_t>(value & 0xFF);
+    dst[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+}
+
+static void WriteLe32(uint8_t *dst, uint32_t value) {
+    dst[0] = static_cast<uint8_t>(value & 0xFF);
+    dst[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    dst[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    dst[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+}
+
+static void WriteLe64(uint8_t *dst, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        dst[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
+    }
+}
+
+static std::vector<uint8_t> BuildTransportPacket(const uint8_t *payload,
+                                                 size_t payload_size,
+                                                 uint64_t frame_id,
+                                                 int64_t sender_capture_utc_us,
+                                                 int64_t sender_send_utc_us) {
+    static const uint16_t kTransportVersion = 2;
+    static const uint16_t kTransportHeaderSize = 40;
+    static const size_t kOuterHeaderSize = 4;
+    static const size_t kInnerHeaderSize = 40;
+
+    const uint32_t body_size =
+        static_cast<uint32_t>(kInnerHeaderSize + payload_size);
+    std::vector<uint8_t> packet(kOuterHeaderSize + body_size);
+
+    packet[0] = static_cast<uint8_t>((body_size >> 24) & 0xFF);
+    packet[1] = static_cast<uint8_t>((body_size >> 16) & 0xFF);
+    packet[2] = static_cast<uint8_t>((body_size >> 8) & 0xFF);
+    packet[3] = static_cast<uint8_t>(body_size & 0xFF);
+
+    uint8_t *header = packet.data() + kOuterHeaderSize;
+    header[0] = 'X';
+    header[1] = 'R';
+    header[2] = 'L';
+    header[3] = 'T';
+    WriteLe16(header + 4, kTransportVersion);
+    WriteLe16(header + 6, kTransportHeaderSize);
+    WriteLe64(header + 8, frame_id);
+    WriteLe64(header + 16, static_cast<uint64_t>(sender_capture_utc_us));
+    WriteLe64(header + 24, static_cast<uint64_t>(sender_send_utc_us));
+    WriteLe32(header + 32, static_cast<uint32_t>(payload_size));
+    WriteLe32(header + 36, 0);
+
+    if (payload_size > 0) {
+        std::copy(payload, payload + payload_size,
+                  packet.begin() + kOuterHeaderSize + kInnerHeaderSize);
+    }
+
+    return packet;
+}
 
 /* Ctrl+C：先停编码与 TCP，再让 listen 模块关掉控制口服务端 */
 static void zed_webcam_on_sigint(int) {
@@ -92,12 +159,24 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer /*user_data*/) {
         if (send_enabled.load() && sender_ptr && sender_ptr->isConnected() &&
             data && size > 0) {
             try {
-                std::vector<uint8_t> packet(4 + size);
-                packet[0] = (size >> 24) & 0xFF;
-                packet[1] = (size >> 16) & 0xFF;
-                packet[2] = (size >>  8) & 0xFF;
-                packet[3] =  size        & 0xFF;
-                std::copy(data, data + size, packet.begin() + 4);
+                const uint64_t frame_id = ++transport_frame_sequence;
+                int64_t sender_capture_utc_us = GetUnixTimeMicroseconds();
+                if (GST_BUFFER_PTS_IS_VALID(buffer) && GST_BUFFER_PTS(buffer) > 0) {
+                    sender_capture_utc_us =
+                        static_cast<int64_t>(GST_BUFFER_PTS(buffer) / 1000);
+                } else if (GST_BUFFER_DTS_IS_VALID(buffer) && GST_BUFFER_DTS(buffer) > 0) {
+                    sender_capture_utc_us =
+                        static_cast<int64_t>(GST_BUFFER_DTS(buffer) / 1000);
+                }
+
+                const int64_t sender_send_utc_us =
+                    GetUnixTimeMicroseconds();
+                std::vector<uint8_t> packet =
+                    BuildTransportPacket(data,
+                                         static_cast<size_t>(size),
+                                         frame_id,
+                                         sender_capture_utc_us,
+                                         sender_send_utc_us);
 
                 sender_ptr->sendData(packet);
 
@@ -124,7 +203,7 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer /*user_data*/) {
 
 /* x264enc.bitrate 单位为 kbps；Open/Pico 侧 bitrate 常为 bps */
 static int bitrateBpsToKbps(int bitrate_bps) {
-    if (bitrate_bps <= 0) return 4000;
+    if (bitrate_bps <= 0) return 20000;
     int kbps = bitrate_bps / 1000;
     return std::max(1, kbps);
 }
@@ -149,7 +228,7 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
      * vbv-buf-capacity 限制编码器 VBV 缓冲为 500 ms，强制近似 CBR，
      * 防止编码器在 I 帧附近爆出大数据包堵塞 TCP 回调线程。
      */
-    int key_int_max = std::max(10, fps);
+    int key_int_max = std::max(10, fps / 2);
 
     std::string pipeline_str =
         "appsrc name=mysource is-live=true format=time "
@@ -177,7 +256,7 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
         pipeline_str += std::string("t. ! ") + kLowLatQueue +
                         "! x265enc tune=zerolatency bitrate=" +
                         std::to_string(bitrate_kbps) +
-                        " speed-preset=ultrafast key-int-max=" +
+                        " speed-preset=superfast key-int-max=" +
                         std::to_string(key_int_max) +
                         " ! h265parse ! appsink name=mysink emit-signals=true "
                         "sync=false ";
@@ -190,7 +269,7 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
             "! videoconvert ! video/x-raw,format=I420 ! "
             "x264enc profile=high tune=zerolatency bitrate=" +
             std::to_string(bitrate_kbps) +
-            " speed-preset=ultrafast key-int-max=" +
+            " speed-preset=superfast key-int-max=" +
             std::to_string(key_int_max) +
             " vbv-buf-capacity=500"
             " option-string=\"nal-hrd=cbr\""
@@ -374,6 +453,7 @@ void streamingThreadFunction() {
                 std::cerr << "readFrame failed" << std::endl;
                 break;
             }
+            const int64_t sender_capture_utc_us = GetUnixTimeMicroseconds();
 
             /* T3：BGR→BGRA 色彩转换完成 */
             cv::Mat bgra;
@@ -421,9 +501,11 @@ void streamingThreadFunction() {
 
             /* 运行时钟：按 fps 均匀递增，与 live appsrc 协商一致 */
             GST_BUFFER_PTS(buffer) =
-                gst_util_uint64_scale(frame_id, GST_SECOND, fps);
+                static_cast<GstClockTime>(sender_capture_utc_us * 1000);
+            GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
             GST_BUFFER_DURATION(buffer) =
                 gst_util_uint64_scale(1, GST_SECOND, fps);
+            GST_BUFFER_OFFSET(buffer) = static_cast<guint64>(frame_id);
 
             GstFlowReturn ret =
                 gst_app_src_push_buffer(GST_APP_SRC(appsrc), buffer);

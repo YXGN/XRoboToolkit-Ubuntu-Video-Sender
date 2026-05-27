@@ -20,7 +20,7 @@ static void print_usage(const char *argv0) {
   std::cout << "       --width W        输出宽（默认 2560）\n";
   std::cout << "       --height H       输出高（默认 720）\n";
   std::cout << "       --fps N          帧率（默认 30）\n";
-  std::cout << "       --bitrate BPS    码率 bps（默认 4000000）\n";
+  std::cout << "       --bitrate BPS    码率 bps（默认 20000000）\n";
   std::cout << "       --hevc           使用 HEVC（默认 H.264）\n";
   std::cout << "\n共用选项：\n";
   std::cout << "  --preview              本机 GStreamer 预览\n";
@@ -42,7 +42,7 @@ int main(int argc, char *argv[]) {
   int send_w = 2560;
   int send_h = 720;
   int send_fps = 30;
-  int send_bitrate = 4000000;
+  int send_bitrate = 20000000;
   bool send_hevc = false;
   std::string mono_cam;
   std::string stereo_cam;

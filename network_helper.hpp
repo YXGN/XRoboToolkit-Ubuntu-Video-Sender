@@ -122,6 +122,39 @@ private:
 
   std::function<void(const std::string &)> data_callback;
   std::function<void()> disconnect_callback;
+  static const uint32_t kMaxProtocolPacketSize = 1024 * 1024;
+
+  static uint32_t readBe32(const uint8_t *data) {
+    return (static_cast<uint32_t>(data[0]) << 24) |
+           (static_cast<uint32_t>(data[1]) << 16) |
+           (static_cast<uint32_t>(data[2]) << 8) |
+           static_cast<uint32_t>(data[3]);
+  }
+
+  void dispatchFramedPackets(std::vector<uint8_t> &pending) {
+    while (data_callback && pending.size() >= 4) {
+      const uint32_t body_length = readBe32(pending.data());
+      if (body_length == 0 || body_length > kMaxProtocolPacketSize) {
+        throw TCPException("Invalid protocol packet length: " +
+                           std::to_string(body_length));
+      }
+
+      const size_t packet_size = 4u + static_cast<size_t>(body_length);
+      if (pending.size() < packet_size) {
+        return;
+      }
+
+      std::string binary_data(pending.begin(), pending.begin() + packet_size);
+      data_callback(binary_data);
+      pending.erase(pending.begin(), pending.begin() + packet_size);
+    }
+  }
+
+  void notifyDisconnected() {
+    if (disconnect_callback) {
+      disconnect_callback();
+    }
+  }
 
   void serverLoop() {
     while (server_running) {
@@ -145,31 +178,31 @@ private:
 
   void handleClient() {
     std::cout << "Handling client communication..." << std::endl;
-    std::vector<uint8_t> buffer(1024);
+    std::vector<uint8_t> buffer(4096);
+    std::vector<uint8_t> pending;
     while (client_connected) {
       ssize_t received = recv(client_socket, buffer.data(), buffer.size(), 0);
       if (received < 0) {
         int error = errno;
         if (error == ECONNRESET || error == EPIPE) {
           std::cerr << "Connection lost: " << strerror(error) << std::endl;
+          notifyDisconnected();
           break;
         }
         std::cerr << "Receive failed: " << strerror(error) << std::endl;
+        notifyDisconnected();
         break;
       } else if (received == 0) {
         std::cout << "Client disconnected gracefully" << std::endl;
-        if (disconnect_callback) {
-          disconnect_callback();
-        }
+        notifyDisconnected();
         break;
       }
 
       if (received > 0 && data_callback) {
-        std::vector<uint8_t> data(buffer.begin(), buffer.begin() + received);
-        std::string binary_data(data.begin(), data.end());
         std::cout << "Received " << received << " bytes from client"
                   << std::endl;
-        data_callback(binary_data);
+        pending.insert(pending.end(), buffer.begin(), buffer.begin() + received);
+        dispatchFramedPackets(pending);
       }
     }
   }
