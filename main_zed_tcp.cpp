@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstring>
+#include <fstream>
 #include <glib-unix.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -19,6 +20,28 @@
 #include <vector>
 
 #include "network_helper.hpp"
+
+// ── Latency Logger ────────────────────────────────────────────────────────────
+static uint64_t getTimestampUs() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+}
+
+class LatencyLogger {
+private:
+    std::ofstream _file;
+public:
+    LatencyLogger(const char* path) : _file(path, std::ios::app) {}
+    ~LatencyLogger() { _file.close(); }
+    void log(const char* msg) {
+        std::cout << msg << std::endl;
+        _file << msg << std::endl;
+        _file.flush();
+    }
+};
+static std::unique_ptr<LatencyLogger> g_latencyLogger;
+static std::atomic<uint64_t> g_frameCounter{0};
 
 // Network Protocol Structures
 struct CameraRequestData {
@@ -440,14 +463,31 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
     if (send_enabled.load() && sender_ptr && sender_ptr->isConnected() &&
         data && size > 0) {
       try {
-        std::vector<uint8_t> packet(4 + size);
+        uint64_t frameId = g_frameCounter++;
+        uint64_t sendTs = getTimestampUs();
+
+        // 协议：4字节(长度) + 8字节(frameId) + payload
+        std::vector<uint8_t> packet(12 + size);
         packet[0] = (size >> 24) & 0xFF;
         packet[1] = (size >> 16) & 0xFF;
         packet[2] = (size >> 8) & 0xFF;
-        packet[3] = (size)&0xFF;
-        std::copy(data, data + size, packet.begin() + 4);
+        packet[3] = (size) & 0xFF;
+        for (int i = 0; i < 8; i++) {
+            packet[4 + i] = (frameId >> (56 - i * 8)) & 0xFF;
+        }
+        std::copy(data, data + size, packet.begin() + 12);
 
         sender_ptr->sendData(packet);
+
+        // 每秒输出一次统计（约60帧）
+        if (g_latencyLogger && frameId % 60 == 0) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "STAGE_SEND,frame_id=%llu,send_ts=%llu",
+                (unsigned long long)frameId,
+                (unsigned long long)sendTs);
+            g_latencyLogger->log(buf);
+        }
       } catch (const TCPException &e) {
         std::cerr << "TCP error in on_new_sample: " << e.what() << std::endl;
         // Don't quit the whole program, just stop streaming
@@ -668,9 +708,12 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  if (send_enabled_mode) {
+    if (send_enabled_mode) {
     std::cout << "Starting direct video streaming to " << send_to_server << ":"
               << send_to_port << "..." << std::endl;
+
+    // 初始化延迟日志
+    g_latencyLogger = std::make_unique<LatencyLogger>("sender_latency.log");
 
     // Set global preview flag
     preview_enabled.store(preview_enabled_local);
