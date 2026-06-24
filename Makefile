@@ -9,6 +9,7 @@
 # Compiler settings
 CXX = g++
 APP := OrinVideoSender
+PROBE_CPP_APP := opencv_fps_probe_cpp
 
 ###############################################################################
 # 默认入口（Ubuntu）：USB 摄像头 --listen（Pico）或 --send（直连 TCP）
@@ -84,6 +85,8 @@ LDFLAGS += $(shell pkg-config --libs libzmq 2>/dev/null || echo "-lzmq")
 
 all: $(APP)
 
+probe_cpp: $(PROBE_CPP_APP)
+
 debug: CXXFLAGS += -DDEBUG -g3 -O0
 debug: $(APP)
 
@@ -95,6 +98,10 @@ $(APP): $(OBJS)
 	@echo "Linking: $@"
 	$(CXX) -o $@ $(OBJS) $(LDFLAGS)
 
+$(PROBE_CPP_APP): opencv_fps_probe_cpp.o
+	@echo "Linking: $@"
+	$(CXX) -o $@ opencv_fps_probe_cpp.o -lopencv_core -lopencv_imgproc -lopencv_videoio -lopencv_imgcodecs -lstdc++
+
 clean:
 	rm -rf $(APP) $(OBJS)
 
@@ -102,4 +109,4 @@ install: $(APP)
 	@echo "Installing $(APP)..."
 	install -D $(APP) /usr/local/bin/$(APP)
 
-.PHONY: all debug clean install
+.PHONY: all debug clean install probe_cpp

@@ -10,6 +10,8 @@
 
 - 在 `--listen IP:PORT` 上作为 **TCP 服务端**，接收头显发来的 **`OPEN_CAMERA` / `CLOSE_CAMERA`**（载荷格式与 `main_zed_tcp.cpp` 一致）。
 - 收到 `OPEN_CAMERA` 后，按载荷中的 **`ip` + `port`** 作为 **TCP 客户端** 连接头显视频接收端，推送 **`4 字节大端长度 + H.264（或 HEVC）`** 码流（与 ZED 版 Sender 一致）。
+- 若同时配置 **`--zmq` / `--zmq-raw`**，则会在 listen 模式下**先自动启动本地采集与 ZMQ 发布**，不再依赖 Pico 先发 `OPEN_CAMERA`；这样可同时支持**Pico 看图**与**主机侧数采**。
+- 在上述 listen+ZMQ 并存场景下，**`CLOSE_CAMERA` / Pico 断开**只会停止 **TCP 发往 Pico** 的一路，**不会停掉本地采集与 ZMQ 数采**。
 - 视频来自 **USB 摄像头**：可用 `--camera /dev/videoN` 指定；否则自动选择 **编号升序下第一个能以 1920×1080 采到一帧** 的设备；双目 SBS 用 **`--stereo-camera`**。
 - 将单目画面 **左右复制并排**（或 SBS 直通），再缩放到 `OPEN_CAMERA` 中的宽高（BGRA），经 **GStreamer `x264enc` / `x265enc`** 软件编码。
 - H.264 路径默认：**I420 + profile High**，且 **`h264parse` 后固定 Annex B（byte-stream）**，无需额外参数即可供 Pico 解码。
@@ -47,12 +49,41 @@ make
 ./OrinVideoSender --help
 ```
 
+### OpenCV 采集链路独立测速
+
+如果你怀疑问题不在网络而在 `OpenCV VideoCapture -> cap.read()`，可以先独立测速：
+
+```bash
+python3 opencv_fps_probe.py --device /dev/video0 --backend v4l2 --width 640 --height 480 --fps 30 --fourcc MJPG --count 300
+```
+
+这个脚本只做：
+
+- `OpenCV` 打开设备
+- 请求指定 `FOURCC / 分辨率 / FPS`
+- 循环 `cap.read()`
+- 打印区间 fps 与总体 fps
+
+如果这里已经只有 `15fps`，问题就在 `OpenCV` 采集路径，不在 sender 的 ZMQ/TCP 传输路径。
+
+如果怀疑 Python `cv2` 与 sender 链接的系统 OpenCV 不是同一套，可以再测一遍 C++ 版 probe：
+
+```bash
+make probe_cpp
+./opencv_fps_probe_cpp --device /dev/video0 --backend v4l2 --width 640 --height 480 --fps 30 --fourcc MJPG --count 300
+./opencv_fps_probe_cpp --device /dev/video0 --backend gstreamer --width 640 --height 480 --fps 30 --fourcc MJPG --count 300
+```
+
+这版和 sender 使用同一套系统 OpenCV，更接近 sender 实际运行环境。
+
 **供 Pico 联调（示例：本机监听 13579，可选本机预览与指定摄像头）：**
 
 ```bash
 ./OrinVideoSender --listen 0.0.0.0:13579
 # 或绑定到局域网 IP
 ./OrinVideoSender --listen 192.168.100.24:13579 --preview --camera /dev/video0
+# Pico 双目显示 + 主机左目 raw 数采
+./OrinVideoSender --listen 0.0.0.0:13579 --zmq-raw tcp://*:5556 --stereo-camera /dev/video0
 ```
 
 **直连推流示例（接收端先监听 TCP）：**

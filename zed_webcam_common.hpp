@@ -10,6 +10,7 @@
  */
 
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <memory>
 #include <utility>
@@ -37,6 +38,7 @@ struct CameraRequestData {
 };
 
 extern CameraRequestData current_camera_config;
+extern std::atomic<uint64_t> current_camera_config_epoch;
 
 /* 进程级退出标志：SIGINT 与各线程循环均检测 */
 extern std::atomic<bool> stop_requested;
@@ -47,12 +49,14 @@ extern std::atomic<bool> encoding_enabled;
 /* appsink 回调中是否允许向 TCP 发送（连接就绪后为 true） */
 extern std::atomic<bool> send_enabled;
 extern std::atomic<bool> preview_enabled;
+extern std::atomic<bool> zmq_enabled;
+extern std::atomic<bool> zmq_raw_mode;
 
 extern std::mutex config_mutex;
 extern std::condition_variable streaming_cv;
 extern std::mutex streaming_mutex;
 
-/* 视频 TCP：客户端连接 send_to_server:send_to_port，负载为「4 字节大端长度 + 编码 AU」 */
+/* 视频 TCP：客户端连接 send_to_server:send_to_port，负载为 XRLT 传输头 + 编码负载 */
 extern std::unique_ptr<TCPClient> sender_ptr;
 extern std::string send_to_server;
 extern int send_to_port;
@@ -74,12 +78,21 @@ void zed_webcam_set_preview_enabled(bool v);
 void zed_webcam_set_camera_paths(const std::string &mono,
                                  const std::string &stereo);
 
+void zed_webcam_set_zmq_endpoint(const std::string &endpoint, bool raw_mode);
+
+bool zed_webcam_has_zmq_endpoint();
+
+void zed_webcam_cleanup_zmq();
+
 /* 按 send_to_server/send_to_port 建立视频 TCP，失败重试至多约 10 次 */
 bool initialize_sender();
 
 void startStreamingThread();
 
 void stopStreamingThread();
+
+/* 仅停止 TCP 发流，保留本地采集/ZMQ；用于 listen+数采 并存场景 */
+void stopTcpSending();
 
 /* 单实例推流线程主体：连接 → OpenCV 采集 → appsrc → GStreamer 编码 → TCP */
 void streamingThreadFunction();

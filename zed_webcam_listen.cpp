@@ -230,8 +230,14 @@ void onDataCallback(const std::string &command) {
 }
 
 void onDisconnectCallback() {
-  std::cout << "Client disconnected, stopping streaming" << std::endl;
-  stopStreamingThread();
+  if (zed_webcam_has_zmq_endpoint()) {
+    std::cout << "Client disconnected, stopping TCP only and keeping local/ZMQ streaming alive"
+              << std::endl;
+    stopTcpSending();
+  } else {
+    std::cout << "Client disconnected, stopping streaming" << std::endl;
+    stopStreamingThread();
+  }
 }
 
 void listenThreadFunction(const std::string &listen_address) {
@@ -289,6 +295,7 @@ void handleOpenCamera(const std::vector<uint8_t> &data) {
     {
       std::lock_guard<std::mutex> lock(config_mutex);
       current_camera_config = cameraConfig;
+      current_camera_config_epoch.fetch_add(1);
     }
 
     send_to_server = cameraConfig.ip;
@@ -297,7 +304,22 @@ void handleOpenCamera(const std::vector<uint8_t> &data) {
     std::cout << "Updated sender target to " << send_to_server << ":"
               << send_to_port << std::endl;
 
-    startStreamingThread();
+    if (streaming_active.load() && zed_webcam_has_zmq_endpoint()) {
+      std::cout << "[listen] streaming already active, keeping ZMQ stream alive and updating TCP target only"
+                << std::endl;
+      stopTcpSending();
+      if (initialize_sender()) {
+        send_enabled.store(true);
+        std::cout << "[listen] TCP sender connected without restarting local capture/ZMQ"
+                  << std::endl;
+      } else {
+        send_enabled.store(false);
+        std::cerr << "[listen] failed to connect TCP sender, keep ZMQ collection running"
+                  << std::endl;
+      }
+    } else {
+      startStreamingThread();
+    }
 
   } catch (const std::exception &e) {
     std::cerr << "Failed to parse camera config: " << e.what() << std::endl;
@@ -313,7 +335,13 @@ void handleOpenCamera(const std::vector<uint8_t> &data) {
 
 void handleCloseCamera(const std::vector<uint8_t> & /*data*/) {
   std::cout << "Handling CLOSE_CAMERA command" << std::endl;
-  stopStreamingThread();
+  if (zed_webcam_has_zmq_endpoint()) {
+    std::cout << "[listen] CLOSE_CAMERA received, stopping TCP only and keeping ZMQ collection alive"
+              << std::endl;
+    stopTcpSending();
+  } else {
+    stopStreamingThread();
+  }
 }
 
 } // namespace
@@ -328,6 +356,12 @@ void zed_webcam_stop_listen_server() {
 void run_listen_mode(const std::string &listen_address) {
   std::cout << "Starting threaded video streaming server (webcam/ZED-protocol)..."
             << std::endl;
+
+  if (zed_webcam_has_zmq_endpoint()) {
+    std::cout << "[listen] detected ZMQ output, auto-starting local capture/streaming before Pico OPEN_CAMERA"
+              << std::endl;
+    startStreamingThread();
+  }
 
   listen_thread =
       make_unique_helper<std::thread>(listenThreadFunction, listen_address);

@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <iostream>
+#include <sstream>
 #include <unistd.h>
 #include <vector>
 
@@ -29,6 +30,38 @@ namespace {
 /* 双目 MJPEG SBS 标准采集分辨率（与 v4l2 枚举一致） */
 static constexpr int kStereoSbsCaptureWidth  = 1856;
 static constexpr int kStereoSbsCaptureHeight = 800;
+static constexpr int kMonoCaptureWidth = 640;
+static constexpr int kMonoCaptureHeight = 480;
+
+struct LoopFpsStats {
+    const char *tag;
+    int report_every;
+    uint64_t count;
+    std::chrono::steady_clock::time_point start_tp;
+
+    explicit LoopFpsStats(const char *tag_name, int every = 120)
+        : tag(tag_name),
+          report_every(every),
+          count(0),
+          start_tp(std::chrono::steady_clock::now()) {}
+
+    void tick(const std::string &detail = std::string()) {
+        ++count;
+        if (report_every <= 0 || (count % static_cast<uint64_t>(report_every)) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - start_tp).count();
+        const double fps = elapsed > 0.0 ? static_cast<double>(report_every) / elapsed : 0.0;
+        std::cout << "[" << tag << "] fps=" << fps;
+        if (!detail.empty()) {
+            std::cout << " " << detail;
+        }
+        std::cout << std::endl;
+        start_tp = now;
+    }
+};
 
 /*
  * 探测某 /dev/video 节点能否以 1920×1080 实际采到一帧。
@@ -40,6 +73,8 @@ static bool probe1080pDevice(const std::string &device_path, std::string &err) {
         err = "无法打开";
         return false;
     }
+    cap.set(cv::CAP_PROP_FOURCC,
+            cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
     cap.set(cv::CAP_PROP_FRAME_WIDTH,  1920);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
     cv::Mat frame;
@@ -96,14 +131,44 @@ static std::string pickAuto1080pDevice() {
     return {};
 }
 
+static std::string buildGstreamerCapturePipeline(const std::string &device,
+                                                 bool stereo_sbs,
+                                                 int fps) {
+    const int width = stereo_sbs ? kStereoSbsCaptureWidth : kMonoCaptureWidth;
+    const int height = stereo_sbs ? kStereoSbsCaptureHeight : kMonoCaptureHeight;
+
+    std::ostringstream oss;
+    oss << "v4l2src device=" << device << " io-mode=2 do-timestamp=true ! "
+        << "image/jpeg,width=" << width
+        << ",height=" << height
+        << ",framerate=" << fps << "/1 ! "
+        << "jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
+        << "appsink drop=true max-buffers=1 sync=false";
+    return oss.str();
+}
+
 /*
- * 打开 V4L2 摄像头（优先 CAP_V4L2，避免与其他 GStreamer 进程争用默认后端）。
+ * 打开 USB 摄像头。
+ * 优先尝试 GStreamer v4l2src + jpegdec + appsink，避免当前 OpenCV V4L2/MJPG
+ * 路径在部分机器上实际只能跑到 15fps；失败后再回退 CAP_V4L2/默认后端。
  *   stereo_sbs : MJPEG + 固定宽高；否则单目 1920×1080
  *   fps        : 与 GStreamer 管线一致，用于驱动侧协商
  */
 static bool openUsbCapture(const std::string &device, bool stereo_sbs, int fps,
                             cv::VideoCapture &cap, std::string &err_detail) {
     err_detail.clear();
+
+    const std::string gst_pipeline =
+        buildGstreamerCapturePipeline(device, stereo_sbs, fps);
+    cv::VideoCapture gst_cap(gst_pipeline, cv::CAP_GSTREAMER);
+    if (gst_cap.isOpened()) {
+        std::cout << "[WebcamCaptureSource] using GStreamer capture pipeline: "
+                  << gst_pipeline << std::endl;
+        cap = std::move(gst_cap);
+        return true;
+    }
+    std::cout << "[WebcamCaptureSource] GStreamer capture open failed, fallback to OpenCV backends. "
+              << "pipeline: " << gst_pipeline << std::endl;
 
     auto configure = [&](cv::VideoCapture &c) -> bool {
         if (!c.isOpened()) return false;
@@ -113,10 +178,19 @@ static bool openUsbCapture(const std::string &device, bool stereo_sbs, int fps,
             c.set(cv::CAP_PROP_FRAME_WIDTH,  kStereoSbsCaptureWidth);
             c.set(cv::CAP_PROP_FRAME_HEIGHT, kStereoSbsCaptureHeight);
         } else {
-            c.set(cv::CAP_PROP_FRAME_WIDTH,  1920);
-            c.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+            /*
+             * 单目 raw 数采优先走 MJPG 640x480：
+             * - 对 USB2.0 / RealSense UVC 更稳
+             * - 避免默认 1080p YUYV 把 USB 带宽打爆
+             * - host 侧当前主要是数采，不需要 sender 端先采 1080p
+             */
+            c.set(cv::CAP_PROP_FOURCC,
+                  cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+            c.set(cv::CAP_PROP_FRAME_WIDTH,  kMonoCaptureWidth);
+            c.set(cv::CAP_PROP_FRAME_HEIGHT, kMonoCaptureHeight);
         }
         c.set(cv::CAP_PROP_FPS, fps);
+        c.set(cv::CAP_PROP_BUFFERSIZE, 1);
         return true;
     };
 
@@ -125,24 +199,41 @@ static bool openUsbCapture(const std::string &device, bool stereo_sbs, int fps,
     int vid = -1;
     if (std::sscanf(device.c_str(), "/dev/video%d", &vid) == 1 && vid >= 0) {
         tmp.open(vid, cv::CAP_V4L2);
-        if (configure(tmp)) { cap = std::move(tmp); return true; }
+        if (configure(tmp)) {
+            std::cout << "[WebcamCaptureSource] fallback to OpenCV CAP_V4L2 capture by index"
+                      << std::endl;
+            cap = std::move(tmp);
+            return true;
+        }
         tmp.release();
     }
 
     tmp.open(device, cv::CAP_V4L2);
-    if (configure(tmp)) { cap = std::move(tmp); return true; }
+    if (configure(tmp)) {
+        std::cout << "[WebcamCaptureSource] fallback to OpenCV CAP_V4L2 capture"
+                  << std::endl;
+        cap = std::move(tmp);
+        return true;
+    }
     tmp.release();
 
     tmp.open(device);
-    if (configure(tmp)) { cap = std::move(tmp); return true; }
+    if (configure(tmp)) {
+        std::cout << "[WebcamCaptureSource] fallback to OpenCV default capture"
+                  << std::endl;
+        cap = std::move(tmp);
+        return true;
+    }
     tmp.release();
 
     int fd = ::open(device.c_str(), O_RDWR | O_NONBLOCK);
     if (fd < 0) {
-        err_detail = std::strerror(errno);
+        err_detail = "GStreamer/CAP_V4L2 打开失败，且底层 open 失败: " +
+                     std::string(std::strerror(errno));
     } else {
         ::close(fd);
-        err_detail = "OpenCV 仍未打开（底层节点可读）；若需独占请先关掉其它取流进程";
+        err_detail =
+            "GStreamer/CAP_V4L2 均未打开（底层节点可读）；若需独占请先关掉其它取流进程";
     }
     return false;
 }
@@ -191,6 +282,23 @@ bool WebcamCaptureSource::open(const std::string &device_path,
         return false;
     }
 
+    const int actual_w = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_WIDTH));
+    const int actual_h = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_HEIGHT));
+    const int actual_fps = static_cast<int>(cap_.get(cv::CAP_PROP_FPS));
+    const int actual_fourcc = static_cast<int>(cap_.get(cv::CAP_PROP_FOURCC));
+    char fourcc_str[5] = {
+        static_cast<char>(actual_fourcc & 0xFF),
+        static_cast<char>((actual_fourcc >> 8) & 0xFF),
+        static_cast<char>((actual_fourcc >> 16) & 0xFF),
+        static_cast<char>((actual_fourcc >> 24) & 0xFF),
+        '\0'
+    };
+    std::cout << "[WebcamCaptureSource] capture opened: " << device
+              << " request_mode=" << (stereo_sbs ? "stereo-sbs" : "mono")
+              << " actual=" << actual_w << "x" << actual_h
+              << " fps=" << actual_fps
+              << " fourcc=" << fourcc_str << std::endl;
+
     /* 启动后台采集线程 */
     running_.store(true);
     capture_thread_ = std::thread(&WebcamCaptureSource::captureLoop, this);
@@ -218,6 +326,7 @@ bool WebcamCaptureSource::open(const std::string &device_path,
 
 void WebcamCaptureSource::captureLoop() {
     cv::Mat frame;
+    LoopFpsStats fps_stats("capture");
     while (running_.load()) {
         if (!cap_.read(frame) || frame.empty()) {
             std::cerr << "[WebcamCaptureSource] cap.read() 失败，后台采集线程退出" << std::endl;
@@ -245,6 +354,7 @@ void WebcamCaptureSource::captureLoop() {
             frame_seq_++;
         }
         frame_cv_.notify_one();
+        fps_stats.tick("size=" + std::to_string(frame.cols) + "x" + std::to_string(frame.rows));
     }
 }
 

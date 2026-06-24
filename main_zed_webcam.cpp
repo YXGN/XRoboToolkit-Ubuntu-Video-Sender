@@ -24,10 +24,12 @@ static void print_usage(const char *argv0) {
   std::cout << "       --hevc           使用 HEVC（默认 H.264）\n";
   std::cout << "\n共用选项：\n";
   std::cout << "  --preview              本机 GStreamer 预览\n";
+  std::cout << "  --zmq ENDPOINT         通过 ZMQ 发布编码流（XRLT 封包）\n";
+  std::cout << "  --zmq-raw ENDPOINT     通过 ZMQ 发布原始 BGRA 图像（XRAW 封包）\n";
   std::cout << "  --camera PATH          单目设备（mono-copy）\n";
   std::cout << "  --stereo-camera PATH   双目 SBS，不复制\n";
   std::cout << "  --help\n";
-  std::cout << "\n说明：无 ZED SDK；码流格式与 Pico 侧一致（大端 4 字节长度 + 负载）。\n";
+  std::cout << "\n说明：无 ZED SDK；TCP 码流使用 XRLT 传输头，ZMQ raw 使用 XRAW 传输头。\n";
 }
 
 int main(int argc, char *argv[]) {
@@ -44,6 +46,8 @@ int main(int argc, char *argv[]) {
   int send_fps = 30;
   int send_bitrate = 20000000;
   bool send_hevc = false;
+  std::string zmq_endpoint;
+  bool zmq_raw = false;
   std::string mono_cam;
   std::string stereo_cam;
 
@@ -70,6 +74,12 @@ int main(int argc, char *argv[]) {
       send_bitrate = std::stoi(argv[++i]);
     } else if (arg == "--hevc") {
       send_hevc = true;
+    } else if (arg == "--zmq" && i + 1 < argc) {
+      zmq_endpoint = argv[++i];
+      zmq_raw = false;
+    } else if (arg == "--zmq-raw" && i + 1 < argc) {
+      zmq_endpoint = argv[++i];
+      zmq_raw = true;
     } else if (arg == "--camera" && i + 1 < argc) {
       mono_cam = argv[++i];
     } else if (arg == "--stereo-camera" && i + 1 < argc) {
@@ -92,8 +102,11 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  if (send_mode && (send_server.empty() || send_port <= 0)) {
-    std::cerr << "错误：--send 需要 --server IP 与 --port PORT" << std::endl;
+  if (send_mode && (send_server.empty() || send_port <= 0) &&
+      zmq_endpoint.empty()) {
+    std::cerr << "错误：--send 至少需要一种输出：TCP(--server/--port) 或 "
+                 "ZMQ(--zmq/--zmq-raw)"
+              << std::endl;
     print_usage(argv[0]);
     return -1;
   }
@@ -101,6 +114,17 @@ int main(int argc, char *argv[]) {
   zed_webcam_install_sigint_handler();
   zed_webcam_set_preview_enabled(preview);
   zed_webcam_set_camera_paths(mono_cam, stereo_cam);
+  zed_webcam_set_zmq_endpoint(zmq_endpoint, zmq_raw);
+
+  {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    current_camera_config.width = send_w;
+    current_camera_config.height = send_h;
+    current_camera_config.fps = send_fps;
+    current_camera_config.bitrate = send_bitrate;
+    current_camera_config.enableMvHevc = send_hevc ? 1 : 0;
+    current_camera_config_epoch.fetch_add(1);
+  }
 
   if (listen_mode) {
     run_listen_mode(listen_addr);
@@ -108,6 +132,8 @@ int main(int argc, char *argv[]) {
     run_send_mode(send_server, send_port, send_w, send_h, send_fps, send_bitrate,
                   send_hevc);
   }
+
+  zed_webcam_cleanup_zmq();
 
   return 0;
 }
