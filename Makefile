@@ -14,8 +14,6 @@ PROBE_CPP_APP := opencv_fps_probe_cpp
 ###############################################################################
 # 默认入口（Ubuntu）：USB 摄像头 --listen（Pico）或 --send（直连 TCP）
 # main_zed_webcam.cpp + zed_webcam_{common,listen,send}.cpp
-###############################################################################
-
 SRCS := \
 	main_zed_webcam.cpp \
 	zed_webcam_common.cpp \
@@ -42,9 +40,9 @@ SRCS := \
 # SRCS := \
 # 	main_zed_asio.cpp
 
-# # UDP w/ asio -- pass
-# SRCS:= \
-# 	main_zed_asio_udp.cpp
+# # UDP w/ asio -- pass (需要 ZED SDK)
+#SRCS:= \
+#	main_zed_asio_udp.cpp
 
 # # [NOT WORKING] Zero Copy - depends on jetson multimedia api
 # SRCS := \

@@ -1,3 +1,6 @@
+#ifndef NETWORK_HELPER_HPP
+#define NETWORK_HELPER_HPP
+
 #include <arpa/inet.h>
 #include <atomic>
 #include <cstdint>
@@ -378,3 +381,5 @@ public:
     disconnect_callback = callback;
   }
 };
+
+#endif // NETWORK_HELPER_HPP

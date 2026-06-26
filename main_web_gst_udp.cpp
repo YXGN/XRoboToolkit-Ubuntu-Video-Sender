@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <errno.h>
 #include <exception>
 #include <fcntl.h>
@@ -14,12 +15,21 @@
 #include <unistd.h>
 #include <vector>
 
-#include "network_helper.hpp"
+#include "network_asio.hpp"
 
-std::unique_ptr<TCPClient> sender_ptr;
+using asio_net::UDPClient;
+using asio_net::TCPServer;
+using asio_net::TCPException;
+
+template <typename T, typename... Args>
+std::unique_ptr<T> make_unique_helper(Args &&...args) {
+  return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+}
+
+std::unique_ptr<UDPClient> sender_ptr;
 GMainLoop *loop = nullptr;
 volatile sig_atomic_t stop_requested = 0;
-bool send_enabled = false; // <-- Global flag for sending
+bool send_enabled = false;
 
 static void signal_handler(int sig) {
   if (!stop_requested && loop) {
@@ -45,33 +55,34 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
   if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
     const uint8_t *data = map.data;
     gsize size = map.size;
-  if (send_enabled && sender_ptr && sender_ptr->isConnected() && data &&
-      size > 0) {
-    try {
-      static uint64_t frame_counter = 0;
-      frame_counter++;
-      if (frame_counter % 30 == 0) { // 每 30 帧打印一次
-        std::cout << "Sent " << frame_counter << " frames" << std::endl;
+    if (send_enabled && sender_ptr && sender_ptr->isConnected() && data &&
+        size > 0) {
+      try {
+        std::vector<uint8_t> packet(4 + size);
+        packet[0] = (size >> 24) & 0xFF;
+        packet[1] = (size >> 16) & 0xFF;
+        packet[2] = (size >> 8) & 0xFF;
+        packet[3] = (size) & 0xFF;
+        std::copy(data, data + size, packet.begin() + 4);
+        sender_ptr->sendData(packet);
+        std::cout << "Sent " << size << " bytes of H.264 data (UDP)" << std::endl;
+      } catch (const TCPException &e) {
+        printErrorAndQuit(e.what());
+      } catch (const std::exception &e) {
+        printErrorAndQuit("Unexpected error during sendData: " +
+                          std::string(e.what()));
       }
-      std::vector<uint8_t> packet(4 + size);
-      packet[0] = (size >> 24) & 0xFF;
-      packet[1] = (size >> 16) & 0xFF;
-      packet[2] = (size >> 8) & 0xFF;
-      packet[3] = (size) & 0xFF;
-      std::copy(data, data + size, packet.begin() + 4);
-      sender_ptr->sendData(packet);
-    } catch (const TCPException &e) {
-      printErrorAndQuit(e.what());
-    } catch (const std::exception &e) {
-      printErrorAndQuit("Unexpected error during sendData: " +
-                        std::string(e.what()));
     }
-  }
 
     gst_buffer_unmap(buffer, &map);
   }
 
-  // 不打印每帧 timestamp，太慢
+  if (buffer) {
+    GstClockTime timestamp = GST_BUFFER_PTS(buffer);
+    std::cout << "Encoded frame at timestamp: "
+              << GST_TIME_AS_MSECONDS(timestamp) << " ms" << std::endl;
+  }
+
   gst_sample_unref(sample);
   return GST_FLOW_OK;
 }
@@ -110,7 +121,7 @@ int main(int argc, char *argv[]) {
       std::cout << "Usage: " << argv[0] << " [options]\n";
       std::cout << "Options:\n";
       std::cout << "  --preview      Enable video preview\n";
-      std::cout << "  --send         Enable sending encoded video over TCP\n";
+      std::cout << "  --send         Enable sending encoded video over UDP\n";
       std::cout << "  --server IP    Server IP address (default: 127.0.0.1)\n";
       std::cout << "  --port PORT    Server port (default: 12345)\n";
       std::cout << "  --device PATH  Video device path (default: /dev/video0)\n";
@@ -121,10 +132,9 @@ int main(int argc, char *argv[]) {
 
   if (send_enabled) {
     try {
-      sender_ptr =
-          std::unique_ptr<TCPClient>(new TCPClient(server_ip, server_port));
+      sender_ptr = make_unique_helper<UDPClient>(server_ip, server_port);
       std::cout << "Attempting to connect to " << server_ip << ":"
-                << server_port << std::endl;
+                << server_port << " (UDP)" << std::endl;
       sender_ptr->connect();
     } catch (const TCPException &e) {
       std::cerr << "Failed to connect to server: " << e.what() << std::endl;
@@ -137,26 +147,22 @@ int main(int argc, char *argv[]) {
   if (preview_enabled) {
     pipeline_desc =
         "v4l2src device=" + video_device + " ! "
-        "video/x-raw,width=1280,height=720,framerate=30/1 ! "
+        "video/x-raw,width=1280,height=720 ! "
         "videoconvert ! "
         "tee name=t "
-        "t. ! queue max-size-time=0 max-size-buffers=1 ! "
-        "x264enc tune=zerolatency bitrate=4000 "
+        "t. ! queue ! x264enc tune=zerolatency bitrate=4000 "
         "speed-preset=ultrafast key-int-max=30 ! "
         "h264parse ! appsink name=mysink emit-signals=true sync=false "
-        "max-buffers=1 drop=true "
-        "t. ! queue max-size-time=0 max-size-buffers=1 ! "
-        "videoconvert ! autovideosink "
+        "t. ! queue ! videoconvert ! autovideosink "
         "sync=false";
   } else {
     pipeline_desc =
         "v4l2src device=" + video_device + " ! "
-        "video/x-raw,width=1280,height=720,framerate=30/1 ! "
+        "video/x-raw,width=1280,height=720 ! "
         "videoconvert ! "
         "x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast "
         "key-int-max=30 ! "
-        "h264parse ! appsink name=mysink emit-signals=true sync=false "
-        "max-buffers=1 drop=true";
+        "h264parse ! appsink name=mysink emit-signals=true sync=false";
   }
 
   GError *error = nullptr;

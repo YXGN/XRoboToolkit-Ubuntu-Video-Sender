@@ -6,8 +6,8 @@
 #include <mutex>
 #include <thread>
 
-void run_send_mode(const std::string &server, int port, int width, int height,
-                   int fps, int bitrate_bps, bool hevc) {
+void run_send_mode(const std::string &server, int port, const std::string &protocol,
+                   int width, int height, int fps, int bitrate_bps, bool hevc) {
   {
     std::lock_guard<std::mutex> lock(config_mutex);
     current_camera_config = CameraRequestData();
@@ -25,11 +25,12 @@ void run_send_mode(const std::string &server, int port, int width, int height,
 
   send_to_server = server;
   send_to_port = port;
+  send_protocol = protocol.empty() ? "tcp" : protocol;
 
   if (!send_to_server.empty() && send_to_port > 0) {
-    std::cout << "[send] 直连推流目标 TCP " << send_to_server << ":" << send_to_port;
+    std::cout << "[send] 直连推流目标 " << send_protocol << "://" << send_to_server << ":" << send_to_port;
   } else {
-    std::cout << "[send] 未配置 TCP 目标，仅输出到 ZMQ";
+    std::cout << "[send] 未配置目标，仅输出到 ZMQ";
   }
   std::cout << "  编码: " << width << "x" << height << " @ " << fps
             << "fps bitrate(bps)=" << bitrate_bps
