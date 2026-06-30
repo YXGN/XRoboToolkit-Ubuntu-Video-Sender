@@ -481,19 +481,20 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
                         "sync=false ";
     } else {
         /*
-         * 低延迟优化（UDP 场景）：
-         *   - 无 vbv-buf-capacity   → 不限制 VBV，允许编码器即时输出
-         *   - 无 nal-hrd=cbr        → 避免 HRD 强制延迟
-         *   - tune=zerolatency      → 消除编码器内部参考帧延迟
-         *   - bframes=0             → 无 B 帧，P/B 帧延迟最小
-         *   - key-int-max=6         → 每 6 帧一个 I 帧（≈200ms），平衡延迟与压缩率
-         *   - leaky=downstream      → 队列满时丢弃旧帧，保证实时性
+         * 硬件编码低延迟优化 (Jetson NVENC)：
+         *   - nvvidconv: 将 CPU 内存数据转换并上传至 NVMM (GPU) 显存
+         *   - nvv4l2h264enc: NVIDIA 硬件编码器
+         *   - maxperf-enable=1 preset-level=1: 启用最高性能与极速预设 (等效 zerolatency)
+         *   - control-rate=1: CBR 码率控制
+         *   - iframeinterval=6: 每 6 帧一个 I 帧（等效 key-int-max=6）
+         *   - insert-sps-pps=1: 保证接收端随时接入能解码
+         *   - bitrate: NVENC 通常以 bps 为单位
          */
         pipeline_str += std::string("t. ! ") + kLowLatQueue +
-            "! videoconvert ! video/x-raw,format=I420 ! "
-            "x264enc profile=high tune=zerolatency bitrate=" +
-            std::to_string(bitrate_kbps) +
-            " speed-preset=superfast key-int-max=6 bframes=0 "
+            "! nvvidconv ! video/x-raw(memory:NVMM),format=I420 ! "
+            "nvv4l2h264enc maxperf-enable=1 preset-level=1 control-rate=1 bitrate=" +
+            std::to_string(bitrate_kbps * 1000) +
+            " iframeinterval=6 insert-sps-pps=1 "
             "! h264parse "
             "! video/x-h264,stream-format=(string)byte-stream,"
             "alignment=(string)au "
