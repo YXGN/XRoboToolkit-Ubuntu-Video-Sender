@@ -1,3 +1,6 @@
+#ifndef NETWORK_HELPER_HPP
+#define NETWORK_HELPER_HPP
+
 #include <arpa/inet.h>
 #include <atomic>
 #include <cstdint>
@@ -6,6 +9,7 @@
 #include <future>
 #include <iostream>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -53,6 +57,8 @@ public:
       throw TCPException("Invalid server IP address: " + server_ip);
     }
 
+    int flag = 1;
+    setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     if (::connect(client_socket, (struct sockaddr *)&server_addr,
                   sizeof(server_addr)) < 0) {
       int error = errno;
@@ -378,3 +384,5 @@ public:
     disconnect_callback = callback;
   }
 };
+
+#endif // NETWORK_HELPER_HPP

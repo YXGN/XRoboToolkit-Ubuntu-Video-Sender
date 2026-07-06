@@ -17,6 +17,10 @@
 
 #include "network_asio.hpp"
 
+using asio_net::UDPClient;
+using asio_net::TCPServer;
+using asio_net::UDPException;
+
 // Network Protocol Structures
 struct CameraRequestData {
   int width;
@@ -221,7 +225,7 @@ bool initialize_sender() {
                 << send_to_port << std::endl;
       sender_ptr->connect();
       return true;
-    } catch (const TCPException &e) {
+    } catch (const UDPException &e) {
       std::cerr << "Failed to connect to server: " << e.what() << std::endl;
       sender_ptr = nullptr;
     }
@@ -529,7 +533,7 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
         std::copy(data, data + size, packet.begin() + 4);
 
         sender_ptr->sendData(packet);
-      } catch (const TCPException &e) {
+      } catch (const UDPException &e) {
         printErrorAndQuit(e.what());
       } catch (const std::exception &e) {
         printErrorAndQuit("Unexpected error during sendData: " +
@@ -577,7 +581,7 @@ void streamingThreadFunction() {
         "tee name=t "
         "t. ! queue ! nvv4l2h264enc maxperf-enable=1 insert-sps-pps=true "
         "preset-level=1"
-        "idrinterval=60 bitrate=4000000 ! h264parse ! appsink name=mysink "
+        "idrinterval=30 bitrate=4000000 ! h264parse ! appsink name=mysink "
         "emit-signals=true sync=false ";
 
     if (preview_enabled.load()) {

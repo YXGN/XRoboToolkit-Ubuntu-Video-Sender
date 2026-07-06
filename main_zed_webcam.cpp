@@ -10,13 +10,14 @@
 #include "zed_webcam_listen.hpp"
 #include "zed_webcam_send.hpp"
 
-static void print_usage(const char *argv0) {
+  static void print_usage(const char *argv0) {
   std::cout << "用法: " << argv0 << " (--listen ADDR | --send ...) [选项]\n\n";
   std::cout << "模式（二选一）：\n";
   std::cout << "  --listen IP:PORT     Pico 控制通道：接收 OPEN_CAMERA / CLOSE_CAMERA\n";
-  std::cout << "  --send               无控制通道：按 CLI 参数直连 TCP 推 H.264/HEVC\n";
+  std::cout << "  --send               无控制通道：按 CLI 参数直连推 H.264/HEVC\n";
   std::cout << "       --server IP      接收端 IP（send 必选）\n";
   std::cout << "       --port PORT      接收端端口（send 必选）\n";
+  std::cout << "       --protocol PROTO 传输协议：tcp（默认）或 udp\n";
   std::cout << "       --width W        输出宽（默认 2560）\n";
   std::cout << "       --height H       输出高（默认 720）\n";
   std::cout << "       --fps N          帧率（默认 30）\n";
@@ -29,7 +30,7 @@ static void print_usage(const char *argv0) {
   std::cout << "  --camera PATH          单目设备（mono-copy）\n";
   std::cout << "  --stereo-camera PATH   双目 SBS，不复制\n";
   std::cout << "  --help\n";
-  std::cout << "\n说明：无 ZED SDK；TCP 码流使用 XRLT 传输头，ZMQ raw 使用 XRAW 传输头。\n";
+  std::cout << "\n说明：无 ZED SDK；TCP 码流使用 XRLT 传输头，UDP 使用分片封包，ZMQ 支持 raw/encoded 两种模式。\n";
 }
 
 int main(int argc, char *argv[]) {
@@ -41,6 +42,7 @@ int main(int argc, char *argv[]) {
   std::string listen_addr;
   std::string send_server;
   int send_port = 0;
+  std::string send_protocol = "tcp";
   int send_w = 2560;
   int send_h = 720;
   int send_fps = 30;
@@ -64,6 +66,8 @@ int main(int argc, char *argv[]) {
       send_server = argv[++i];
     } else if (arg == "--port" && i + 1 < argc) {
       send_port = std::stoi(argv[++i]);
+    } else if (arg == "--protocol" && i + 1 < argc) {
+      send_protocol = argv[++i];
     } else if (arg == "--width" && i + 1 < argc) {
       send_w = std::stoi(argv[++i]);
     } else if (arg == "--height" && i + 1 < argc) {
@@ -129,7 +133,8 @@ int main(int argc, char *argv[]) {
   if (listen_mode) {
     run_listen_mode(listen_addr);
   } else {
-    run_send_mode(send_server, send_port, send_w, send_h, send_fps, send_bitrate,
+    run_send_mode(send_server, send_port, send_protocol,
+                  send_w, send_h, send_fps, send_bitrate,
                   send_hevc);
   }
 

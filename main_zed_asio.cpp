@@ -13,6 +13,10 @@
 
 #include "network_asio.hpp"
 
+using asio_net::TCPClient;
+using asio_net::TCPServer;
+using asio_net::TCPException;
+
 std::unique_ptr<TCPClient> sender_ptr;
 volatile sig_atomic_t stop_requested = 0;
 bool send_enabled = false; // <-- Global flag for sending
