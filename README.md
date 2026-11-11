@@ -8,19 +8,88 @@
 
 ### `--listen`（与 Pico 联调）
 
-- 在 `--listen IP:PORT` 上作为 **TCP 服务端**，接收头显发来的 **`OPEN_CAMERA` / `CLOSE_CAMERA`**（载荷格式与 `main_zed_tcp.cpp` 一致）。
-- 收到 `OPEN_CAMERA` 后，按载荷中的 **`ip` + `port`** 作为 **TCP 客户端** 连接头显视频接收端，推送 **`4 字节大端长度 + H.264（或 HEVC）`** 码流（与 ZED 版 Sender 一致）。
-- 若同时配置 **`--zmq` / `--zmq-raw`**，则会在 listen 模式下**先自动启动本地采集与 ZMQ 发布**，不再依赖 Pico 先发 `OPEN_CAMERA`；这样可同时支持**Pico 看图**与**主机侧数采**。
-- 在上述 listen+ZMQ 并存场景下，**`CLOSE_CAMERA` / Pico 断开**只会停止 **TCP 发往 Pico** 的一路，**不会停掉本地采集与 ZMQ 数采**。
+- 在 `--listen IP:PORT` 上作为 **TCP 服务端**，接收头显发来的 **`OPEN_CAMERA` / `CLOSE_CAMERA`**。载荷格式见下文「传输协议概要」。
+- 收到 `OPEN_CAMERA` 后，按载荷中的 **`ip` + `port`** 作为 **TCP 客户端** 连接头显视频接收端，推送 **`[4 字节大端长度][XRLT 头][H.264 / HEVC payload]`** 码流。
 - 视频来自 **USB 摄像头**：可用 `--camera /dev/videoN` 指定；否则自动选择 **编号升序下第一个能以 1920×1080 采到一帧** 的设备；双目 SBS 用 **`--stereo-camera`**。
-- 将单目画面 **左右复制并排**（或 SBS 直通），再缩放到 `OPEN_CAMERA` 中的宽高（BGRA），经 **GStreamer `x264enc` / `x265enc`** 软件编码。
-- H.264 路径默认：**I420 + profile High**，且 **`h264parse` 后固定 Annex B（byte-stream）**，无需额外参数即可供 Pico 解码。
+- 单目画面 **左右复制并排** 后再缩放到 `OPEN_CAMERA` 中的宽高（BGRA），**双目 SBS 设备**则直通不复制，经 **GStreamer `x264enc` / `x265enc`** 软件编码。
+- H.264 路径默认：**I420 + profile High**（`appsrc → videoconvert → I420 → x264enc → h264parse → appsink`），输出 **Annex B（byte-stream）** + AU 对齐，无需额外参数即可供 Pico 解码。
 
 ### `--send`（无 Pico 控制通道）
 
-- 使用 **`--send --server IP --port PORT`**，按命令行分辨率/帧率/码率（可选 **`--hevc`**）连接接收端并推送 **相同长度前缀 + 码流** 格式。
-- 默认值与常见 Pico 请求接近：`2560x720`、`30fps`、`4000000` bps；可用 **`--width` / `--height` / `--fps` / `--bitrate`** 覆盖。
-- **`--camera` / `--stereo-camera` / `--preview`** 与 `--listen` 共用。
+- 使用 **`--send --server IP --port PORT`**（可选 `--protocol udp`），按命令行分辨率/帧率/码率（可选 `--hevc`）连接接收端并推送 **相同 `[4B 大端长度][XRLT 头][payload]`** 格式。
+- 默认值与常见 Pico 请求接近：`2560x720`、`30fps`、`20000000` bps；可用 **`--width` / `--height` / `--fps` / `--bitrate`** 覆盖。
+- **`--camera` / `--stereo-camera` / `--preview` / `--zmq` / `--zmq-raw`** 与 `--listen` 共用。
+
+### `--listen + ZMQ` 数采约定（与 `xr_teleoperate` 并存）
+
+当同时配置 **`--listen IP:PORT`** 与 **`--zmq` / `--zmq-raw`** 时，行为由 `zed_webcam_listen.cpp` / `zed_webcam_common.cpp` 严格定义：
+
+1. Sender **先自动启动本地采集与 ZMQ 发布**，不再依赖 Pico 先发 `OPEN_CAMERA`。
+2. **`CLOSE_CAMERA` / Pico 断开**只停止 **TCP 发往 Pico** 的那一路；**不会停掉本地采集与 ZMQ 数采**（见 `zed_webcam_common.cpp:701 stopTcpSending()`）。
+3. **raw 数采分辨率**由相机输入决定，**不再跟随 `OPEN_CAMERA` 中的 width/height**（见 `agents.md` §3）。例如输入 `1856x800` SBS 时，`--zmq-raw` 只发 LEFT 半幅 `928x800`。
+4. `OPEN_CAMERA` 到达时只触发 **encoded pipeline 重配**，**不重启采集线程**。
+
+这是为了避免「Pico 接入 → 采集线程被踢 → host 侧 `episode_writer.py` 报对齐 warning」的回归。
+
+### 传输协议概要（详细见 `README_video_pipeline.md`）
+
+**TCP 视频（`--send` 或 `--listen` 的 encoded 路径）**
+
+```
+[4 字节大端 uint32: body_len][body]
+body = [XRLT 头 40 字节][编码 payload]
+```
+
+`XRLT` 头（小端，定义在 `zed_webcam_common.cpp:151`）：
+
+| 偏移 | 字段 | 说明 |
+|------|------|------|
+| 0 | `magic` | `XRLT`（4 字节） |
+| 4 | `version` | `2`（u16 LE） |
+| 6 | `header_size` | `40`（u16 LE） |
+| 8 | `frame_id` | 单调递增（u64 LE） |
+| 16 | `sender_capture_utc_us` | 采集时刻（u64 LE） |
+| 24 | `sender_send_utc_us` | TCP 发送时刻（u64 LE） |
+| 32 | `payload_size` | 紧随其后的编码负载字节数（u32 LE） |
+| 36 | `reserved` | `0`（u32 LE） |
+
+**UDP 视频（`--send --protocol udp`）**
+
+大帧会被切成 1463 字节一片，每片格式：
+```
+[0xFF][is_last 0xFF/0x00][4B total_size BE][4B offset BE][payload]
+```
+小帧可单包发送，格式与 TCP 相同：`[4B BE len][XRLT][payload]`。
+
+**ZMQ raw（`--zmq-raw`，对接 `xr_teleoperate/teleop/utils/episode_writer.py: ZMQRawCameraReceiver`）**
+
+```
+[XRAW][4B version=1 BE][4B width BE][4B height BE][4B channels BE]
+[8B frame_seq BE][8B source_wall_time_ns BE][8B source_monotonic_ns BE]
+[raw BGRA 像素]
+```
+字段定义见 `zed_webcam_common.cpp:BuildRawImagePacket`。
+
+**ZMQ encoded（`--zmq`）**
+
+与 TCP 一致：`[4B BE len][XRLT 头][H.264 / HEVC payload]`。
+
+**控制协议（`--listen` 的 `OPEN_CAMERA` / `CLOSE_CAMERA`）**
+
+外层：`[4B big-endian bodyLength][body]`
+内层 `NetworkDataProtocol`：`[4B LE cmdLen][cmd][4B LE dataLen][data]`
+`OPEN_CAMERA` 载荷 `CameraRequestData`：
+
+| 偏移 | 字段 | 说明 |
+|------|------|------|
+| 0 | `magic` | `0xCA 0xFE` |
+| 2 | `version` | `1` |
+| 3..31 | `width/height/fps/bitrate/enableMvHevc/renderMode/port` | i32 LE |
+| 32 | `camera_len` | u8，后面跟 UTF-8 字符串 |
+| 33+ | `camera` | 头显声明的相机类型，原样回显 |
+| | `ip` | 视频回连目标 IP（同样紧凑串） |
+
+`CLOSE_CAMERA` 载荷为空。
 
 ### 依赖（Ubuntu）
 
@@ -76,21 +145,58 @@ make probe_cpp
 
 这版和 sender 使用同一套系统 OpenCV，更接近 sender 实际运行环境。
 
-**供 Pico 联调（示例：本机监听 13579，可选本机预览与指定摄像头）：**
+**Pico 联调 + 数采（`--listen` + `--zmq-raw`，详见下一节）：**
+
+> 下面示例中的 IP 都是**示例**，请换成你机器上的真实地址（`--listen` 后是 Sender 自己绑定 IP；`--server` 后是 Windows PC IP；`--zmq-raw` 后是 Sender 自己监听 IP）。
 
 ```bash
 ./OrinVideoSender --listen 0.0.0.0:13579
-# 或绑定到局域网 IP
+# 或绑定到局域网 IP，并打开本机预览、指定单目设备（192.168.100.24 改成本机局域网 IP）
 ./OrinVideoSender --listen 192.168.100.24:13579 --preview --camera /dev/video0
-# Pico 双目显示 + 主机左目 raw 数采
+# Pico 双目显示（SBS 直通）+ 主机数采（ZMQ raw）
 ./OrinVideoSender --listen 0.0.0.0:13579 --zmq-raw tcp://*:5556 --stereo-camera /dev/video0
 ```
 
-**直连推流示例（接收端先监听 TCP）：**
+**直连推流（`--send`，接收端先监听 TCP 或 UDP）：**
 
 ```bash
-./OrinVideoSender --send --server 192.168.100.41 --port 12345 --stereo-camera /dev/video12
-# 可选：--width 2560 --height 720 --fps 30 --bitrate 4000000 --hevc
+# 192.168.100.59 改成运行 Viewer 的 Windows PC 的真实局域网 IP；端口与 appsettings.json 的 listenPort 一致
+./OrinVideoSender --send --server 192.168.100.59 --port 12345 --protocol tcp
+# 可选：--width 2560 --height 720 --fps 30 --bitrate 20000000 --hevc
+# 加双路 SBS 直通：
+#           --stereo-camera /dev/video12
+```
+
+**完整 CLI 参数（来自 `main_zed_webcam.cpp`）：**
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--listen IP:PORT` | Pico 控制通道：在此地址起 `TCPServer`，等 `OPEN_CAMERA`（与 `--send` 互斥） | — |
+| `--send` | 无控制通道直连推流（与 `--listen` 互斥） | — |
+| `--server IP` | send 模式接收端 IP | — |
+| `--port PORT` | send 模式接收端端口 | — |
+| `--protocol tcp\|udp` | send 模式传输协议 | `tcp` |
+| `--width W` | 输出宽 | `2560` |
+| `--height H` | 输出高 | `720` |
+| `--fps N` | 帧率 | `30` |
+| `--bitrate BPS` | 码率（bps；`x264enc` 内部换算为 kbps） | `20000000` |
+| `--hevc` | 使用 `x265enc` + `h265parse`（默认 H.264 + `x264enc`） | H.264 |
+| `--preview` | 本机 `autovideosink` 预览支路 | 关 |
+| `--camera /dev/videoN` | 单目设备（mono-copy 后编码） | 自动探测 |
+| `--stereo-camera /dev/videoN` | 双目 SBS 设备（直通，按 SBS 编码） | — |
+| `--zmq tcp://*:PORT` | ZMQ 发布 encoded 帧（XRLT 封包） | — |
+| `--zmq-raw tcp://*:PORT` | ZMQ 发布原始 BGRA 帧（XRAW 封包，对接 `xr_teleoperate`） | — |
+| `--help` | 打印 usage | — |
+
+**多机位数采**：仓库根目录提供 `start_four_cams_new.sh`（head + 双 wrist + Pico stereo 共 4 个 sender 实例），通过环境变量指定设备路径和端口：
+
+> 下面 `BIND_IP` 是**示例**（192.168.123.164），请换成实际 Sender 机器的局域网 IP；其余 `*_CAM` 也请按本机 `/dev/videoN` 实际编号替换。
+
+```bash
+BIND_IP=192.168.123.164 \
+  HEAD_CAM=/dev/video0 LEFT_WRIST_CAM=/dev/video4 RIGHT_WRIST_CAM=/dev/video2 \
+  PICO_STEREO_CAM=/dev/video0 \
+  ./start_four_cams_new.sh
 ```
 
 头显侧按官方流程：选择 ZED 类视频源、输入 **运行 Sender 的机器 IP**、收听。首次联调请在 Sender 终端查看日志里 **`OPEN_CAMERA` 解析出的 `camera` 字符串**（可能为 `ZED`、`ZEDMINI` 等）；当前实现 **不因类型非 `ZED` 而拒绝开流**，便于兼容；确认后再考虑在代码中加白名单。

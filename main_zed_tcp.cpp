@@ -440,12 +440,43 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
     if (send_enabled.load() && sender_ptr && sender_ptr->isConnected() &&
         data && size > 0) {
       try {
-        std::vector<uint8_t> packet(4 + size);
-        packet[0] = (size >> 24) & 0xFF;
-        packet[1] = (size >> 16) & 0xFF;
-        packet[2] = (size >> 8) & 0xFF;
-        packet[3] = (size)&0xFF;
-        std::copy(data, data + size, packet.begin() + 4);
+        uint32_t payload_size = static_cast<uint32_t>(size);
+        uint32_t body_size = 40 + payload_size; // XRLT header (40 bytes) + payload
+        std::vector<uint8_t> packet(4 + body_size);
+
+        // Outer header: 4-byte big-endian body_size
+        packet[0] = static_cast<uint8_t>((body_size >> 24) & 0xFF);
+        packet[1] = static_cast<uint8_t>((body_size >> 16) & 0xFF);
+        packet[2] = static_cast<uint8_t>((body_size >> 8) & 0xFF);
+        packet[3] = static_cast<uint8_t>(body_size & 0xFF);
+
+        uint8_t *header = packet.data() + 4;
+        header[0] = 'X'; header[1] = 'R'; header[2] = 'L'; header[3] = 'T';
+        
+        // version (1) - 16-bit little-endian
+        header[4] = 1; header[5] = 0;
+        // header_size (40) - 16-bit little-endian
+        header[6] = 40; header[7] = 0;
+        
+        static uint64_t frame_seq = 0;
+        uint64_t fid = ++frame_seq;
+        for (int i = 0; i < 8; i++) header[8 + i] = (fid >> (i * 8)) & 0xFF;
+        
+        auto now = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::system_clock::now());
+        uint64_t timestamp_us = now.time_since_epoch().count();
+        
+        // sender_capture_utc_us (8 bytes, little-endian)
+        for (int i = 0; i < 8; i++) header[16 + i] = (timestamp_us >> (i * 8)) & 0xFF;
+        // sender_send_utc_us (8 bytes, little-endian)
+        for (int i = 0; i < 8; i++) header[24 + i] = (timestamp_us >> (i * 8)) & 0xFF;
+        
+        // payload_size (4 bytes, little-endian)
+        for (int i = 0; i < 4; i++) header[32 + i] = (payload_size >> (i * 8)) & 0xFF;
+        
+        // reserved (4 bytes)
+        for (int i = 0; i < 4; i++) header[36 + i] = 0;
+
+        std::copy(data, data + size, packet.begin() + 44);
 
         sender_ptr->sendData(packet);
       } catch (const TCPException &e) {
@@ -583,7 +614,7 @@ std::string buildPipelineString(const CameraRequestData &config,
   pipeline_str +=
       "t. ! queue ! " + encoder + " maxperf-enable=1 insert-sps-pps=true ";
   pipeline_str +=
-      "idrinterval=15 bitrate=" + std::to_string(config.bitrate) + " ! ";
+      "idrinterval=60 bitrate=" + std::to_string(config.bitrate) + " ! ";
   pipeline_str +=
       parser + " ! appsink name=mysink emit-signals=true sync=false ";
 

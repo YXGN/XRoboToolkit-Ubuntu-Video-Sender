@@ -3,7 +3,7 @@
 
 #include <string>
 
-void run_send_mode(const std::string &server, int port, int width, int height,
-                   int fps, int bitrate_bps, bool hevc);
+void run_send_mode(const std::string &server, int port, const std::string &protocol,
+                   int width, int height, int fps, int bitrate_bps, bool hevc);
 
 #endif

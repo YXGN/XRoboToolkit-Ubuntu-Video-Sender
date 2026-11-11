@@ -13,12 +13,12 @@
 #include <cstdint>
 #include <condition_variable>
 #include <memory>
-#include <utility>
 #include <mutex>
 #include <string>
 #include <thread>
 
 #include "network_helper.hpp"
+#include "network_asio.hpp"
 
 /* 与 Pico OPEN_CAMERA 载荷对齐的编码/路由参数（send 模式由 CLI 填充同等语义字段） */
 struct CameraRequestData {
@@ -58,8 +58,11 @@ extern std::mutex streaming_mutex;
 
 /* 视频 TCP：客户端连接 send_to_server:send_to_port，负载为 XRLT 传输头 + 编码负载 */
 extern std::unique_ptr<TCPClient> sender_ptr;
+/* 视频 UDP：客户端连接 send_to_server:send_to_port，分片封包（类在 network_asio.hpp 中定义） */
+extern std::unique_ptr<asio_net::UDPClient> udp_sender_ptr;
 extern std::string send_to_server;
 extern int send_to_port;
+extern std::string send_protocol;  /* "tcp" 或 "udp" */
 
 /* 命令行传入：空表示走默认（单目自动探测 / 无双目设备） */
 extern std::string g_cli_camera_path;
@@ -86,6 +89,8 @@ void zed_webcam_cleanup_zmq();
 
 /* 按 send_to_server/send_to_port 建立视频 TCP，失败重试至多约 10 次 */
 bool initialize_sender();
+/* 按 send_to_server/send_to_port 建立视频 UDP（无连接建立，直接发） */
+bool initialize_udp_sender();
 
 void startStreamingThread();
 

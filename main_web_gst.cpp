@@ -45,34 +45,33 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
   if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
     const uint8_t *data = map.data;
     gsize size = map.size;
-    if (send_enabled && sender_ptr && sender_ptr->isConnected() && data &&
-        size > 0) {
-      try {
-        std::vector<uint8_t> packet(4 + size);
-        packet[0] = (size >> 24) & 0xFF;
-        packet[1] = (size >> 16) & 0xFF;
-        packet[2] = (size >> 8) & 0xFF;
-        packet[3] = (size)&0xFF;
-        std::copy(data, data + size, packet.begin() + 4);
-        sender_ptr->sendData(packet);
-        std::cout << "Sent " << size << " bytes of H.264 data" << std::endl;
-      } catch (const TCPException &e) {
-        printErrorAndQuit(e.what());
-      } catch (const std::exception &e) {
-        printErrorAndQuit("Unexpected error during sendData: " +
-                          std::string(e.what()));
+  if (send_enabled && sender_ptr && sender_ptr->isConnected() && data &&
+      size > 0) {
+    try {
+      static uint64_t frame_counter = 0;
+      frame_counter++;
+      if (frame_counter % 30 == 0) { // 每 30 帧打印一次
+        std::cout << "Sent " << frame_counter << " frames" << std::endl;
       }
+      std::vector<uint8_t> packet(4 + size);
+      packet[0] = (size >> 24) & 0xFF;
+      packet[1] = (size >> 16) & 0xFF;
+      packet[2] = (size >> 8) & 0xFF;
+      packet[3] = (size) & 0xFF;
+      std::copy(data, data + size, packet.begin() + 4);
+      sender_ptr->sendData(packet);
+    } catch (const TCPException &e) {
+      printErrorAndQuit(e.what());
+    } catch (const std::exception &e) {
+      printErrorAndQuit("Unexpected error during sendData: " +
+                        std::string(e.what()));
     }
+  }
 
     gst_buffer_unmap(buffer, &map);
   }
 
-  if (buffer) {
-    GstClockTime timestamp = GST_BUFFER_PTS(buffer);
-    std::cout << "Encoded frame at timestamp: "
-              << GST_TIME_AS_MSECONDS(timestamp) << " ms" << std::endl;
-  }
-
+  // 不打印每帧 timestamp，太慢
   gst_sample_unref(sample);
   return GST_FLOW_OK;
 }
@@ -138,22 +137,26 @@ int main(int argc, char *argv[]) {
   if (preview_enabled) {
     pipeline_desc =
         "v4l2src device=" + video_device + " ! "
-        "video/x-raw,width=1280,height=720 ! "
+        "video/x-raw,width=1280,height=720,framerate=30/1 ! "
         "videoconvert ! "
         "tee name=t "
-        "t. ! queue ! x264enc tune=zerolatency bitrate=4000 "
+        "t. ! queue max-size-time=0 max-size-buffers=1 ! "
+        "x264enc tune=zerolatency bitrate=4000 "
         "speed-preset=ultrafast key-int-max=30 ! "
         "h264parse ! appsink name=mysink emit-signals=true sync=false "
-        "t. ! queue ! videoconvert ! autovideosink "
+        "max-buffers=1 drop=true "
+        "t. ! queue max-size-time=0 max-size-buffers=1 ! "
+        "videoconvert ! autovideosink "
         "sync=false";
   } else {
     pipeline_desc =
         "v4l2src device=" + video_device + " ! "
-        "video/x-raw,width=1280,height=720 ! "
+        "video/x-raw,width=1280,height=720,framerate=30/1 ! "
         "videoconvert ! "
         "x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast "
         "key-int-max=30 ! "
-        "h264parse ! appsink name=mysink emit-signals=true sync=false";
+        "h264parse ! appsink name=mysink emit-signals=true sync=false "
+        "max-buffers=1 drop=true";
   }
 
   GError *error = nullptr;

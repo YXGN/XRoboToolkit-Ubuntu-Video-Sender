@@ -53,8 +53,10 @@ std::condition_variable streaming_cv;
 std::mutex streaming_mutex;
 
 std::unique_ptr<TCPClient> sender_ptr;
+std::unique_ptr<asio_net::UDPClient> udp_sender_ptr;
 std::string send_to_server;
 int send_to_port = 0;
+std::string send_protocol = "tcp";
 
 std::string g_cli_camera_path;
 std::string g_cli_stereo_camera_path;
@@ -313,9 +315,13 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer /*user_data*/) {
         const bool tcp_ready =
             send_enabled.load() && sender_ptr && sender_ptr->isConnected() &&
             data && size > 0;
+
+        const bool udp_ready =
+            send_enabled.load() && udp_sender_ptr && udp_sender_ptr->isConnected() &&
+            data && size > 0;
+
         const bool zmq_ready =
             !zmq_raw_mode.load() && zmq_enabled.load() && data && size > 0;
-
         uint64_t frame_id = 0;
         int64_t sender_capture_utc_us = 0;
         int64_t sender_send_utc_us = 0;
@@ -353,6 +359,47 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer /*user_data*/) {
                 streaming_active.store(false);
             } catch (const std::exception &e) {
                 std::cerr << "Unexpected error in on_new_sample: " << e.what() << std::endl;
+                streaming_active.store(false);
+            }
+        } else if (udp_ready) {
+            try {
+                if (size <= kUdpMaxPayload) {
+                    auto pkt = std::make_shared<std::vector<uint8_t>>(4 + size);
+                    (*pkt)[0] = static_cast<uint8_t>((size >> 24) & 0xFF);
+                    (*pkt)[1] = static_cast<uint8_t>((size >> 16) & 0xFF);
+                    (*pkt)[2] = static_cast<uint8_t>((size >>  8) & 0xFF);
+                    (*pkt)[3] = static_cast<uint8_t>(size & 0xFF);
+                    std::memcpy(pkt->data() + 4, data, size);
+                    udp_sender_ptr->sendDataAsync(*pkt);
+                } else {
+                    const size_t payload_per_frag = kUdpMaxPayload;
+                    size_t offset = 0;
+                    while (offset < size) {
+                        size_t chunk = std::min(payload_per_frag, size - offset);
+                        bool is_last = (offset + chunk >= size);
+                        auto frag = std::make_shared<std::vector<uint8_t>>(10 + chunk);
+                        (*frag)[0] = 0xFF;
+                        (*frag)[1] = is_last ? 0xFF : 0x00;
+                        (*frag)[2] = static_cast<uint8_t>((size >> 24) & 0xFF);
+                        (*frag)[3] = static_cast<uint8_t>((size >> 16) & 0xFF);
+                        (*frag)[4] = static_cast<uint8_t>((size >>  8) & 0xFF);
+                        (*frag)[5] = static_cast<uint8_t>(size & 0xFF);
+                        (*frag)[6] = static_cast<uint8_t>((offset >> 24) & 0xFF);
+                        (*frag)[7] = static_cast<uint8_t>((offset >> 16) & 0xFF);
+                        (*frag)[8] = static_cast<uint8_t>((offset >>  8) & 0xFF);
+                        (*frag)[9] = static_cast<uint8_t>(offset & 0xFF);
+                        std::memcpy(frag->data() + 10, data + offset, chunk);
+                        udp_sender_ptr->sendDataAsync(*frag);
+                        offset += chunk;
+                    }
+                }
+
+                const int64_t t7 = lat_now_ns();
+                if (t5 > 0) {
+                    LatencyTracker::get().add_encode_send(t5, t6, t7);
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "UDP error in on_new_sample: " << e.what() << std::endl;
                 streaming_active.store(false);
             }
         }
@@ -434,18 +481,21 @@ static std::string buildWebcamPipelineString(const CameraRequestData &config,
                         "sync=false ";
     } else {
         /*
-         * vbv-buf-capacity=500  → VBV 缓冲上限 500 ms，强制编码器平滑输出（近似 CBR）
-         * option-string 中的 nal-hrd=cbr 配合 VBV 让码率控制更严格。
+         * 硬件编码低延迟优化 (Jetson NVENC)：
+         *   - nvvidconv: 将 CPU 内存数据转换并上传至 NVMM (GPU) 显存
+         *   - nvv4l2h264enc: NVIDIA 硬件编码器
+         *   - maxperf-enable=1 preset-level=1: 启用最高性能与极速预设 (等效 zerolatency)
+         *   - control-rate=1: CBR 码率控制
+         *   - iframeinterval=6: 每 6 帧一个 I 帧（等效 key-int-max=6）
+         *   - insert-sps-pps=1: 保证接收端随时接入能解码
+         *   - bitrate: NVENC 通常以 bps 为单位
          */
         pipeline_str += std::string("t. ! ") + kLowLatQueue +
-            "! videoconvert ! video/x-raw,format=I420 ! "
-            "x264enc profile=high tune=zerolatency bitrate=" +
-            std::to_string(bitrate_kbps) +
-            " speed-preset=superfast key-int-max=" +
-            std::to_string(key_int_max) +
-            " vbv-buf-capacity=500"
-            " option-string=\"nal-hrd=cbr\""
-            " ! h264parse "
+            "! nvvidconv ! video/x-raw(memory:NVMM),format=I420 ! "
+            "nvv4l2h264enc maxperf-enable=1 preset-level=1 control-rate=1 bitrate=" +
+            std::to_string(bitrate_kbps * 1000) +
+            " iframeinterval=6 insert-sps-pps=1 "
+            "! h264parse "
             "! video/x-h264,stream-format=(string)byte-stream,"
             "alignment=(string)au "
             "! appsink name=mysink emit-signals=true sync=false ";
@@ -598,6 +648,19 @@ bool initialize_sender() {
     return false;
 }
 
+bool initialize_udp_sender() {
+    if (send_to_server.empty() || send_to_port <= 0) return false;
+    try {
+        udp_sender_ptr = make_unique_helper<asio_net::UDPClient>(send_to_server, send_to_port);
+        udp_sender_ptr->connect();
+        return true;
+    } catch (const std::exception &e) {
+        std::cerr << "Failed to initialize UDP sender: " << e.what() << std::endl;
+        udp_sender_ptr = nullptr;
+        return false;
+    }
+}
+
 void startStreamingThread() {
     std::lock_guard<std::mutex> lock(streaming_mutex);
     if (streaming_thread && streaming_thread->joinable()) {
@@ -622,6 +685,11 @@ void stopStreamingThread() {
     }
     sender_ptr = nullptr;
 
+    if (udp_sender_ptr) {
+        udp_sender_ptr->disconnect();
+        udp_sender_ptr = nullptr;
+    }
+
     if (streaming_thread && streaming_thread->joinable()) {
         streaming_cv.notify_all();
         streaming_thread->join();
@@ -640,6 +708,11 @@ void stopTcpSending() {
         }
     }
     sender_ptr = nullptr;
+
+    if (udp_sender_ptr) {
+        udp_sender_ptr->disconnect();
+        udp_sender_ptr = nullptr;
+    }
 }
 
 /*
@@ -658,15 +731,25 @@ void streamingThreadFunction() {
 
     try {
         bool tcp_initialized = false;
+        bool udp_initialized = false;
+
         if (!send_to_server.empty() && send_to_port > 0) {
-            tcp_initialized = initialize_sender();
-            if (!tcp_initialized) {
-                std::cerr << "Failed to initialize TCP sender";
-                if (!zed_webcam_has_zmq_endpoint()) {
-                    std::cerr << ", streaming thread stopping" << std::endl;
+            if (send_protocol == "udp") {
+                udp_initialized = initialize_udp_sender();
+                if (!udp_initialized && !zed_webcam_has_zmq_endpoint()) {
+                    std::cerr << "UDP init failed, streaming thread stopping" << std::endl;
                     return;
                 }
-                std::cerr << ", continue with ZMQ only" << std::endl;
+            } else {
+                tcp_initialized = initialize_sender();
+                if (!tcp_initialized) {
+                    std::cerr << "Failed to initialize TCP sender";
+                    if (!zed_webcam_has_zmq_endpoint()) {
+                        std::cerr << ", streaming thread stopping" << std::endl;
+                        return;
+                    }
+                    std::cerr << ", continue with ZMQ only" << std::endl;
+                }
             }
         }
 
@@ -676,15 +759,15 @@ void streamingThreadFunction() {
             zmq_enabled.store(zmq_initialized);
         }
 
-        if (!tcp_initialized && !zmq_initialized) {
-            std::cerr << "No output available (TCP/ZMQ both unavailable), "
+        if (!tcp_initialized && !udp_initialized && !zmq_initialized) {
+            std::cerr << "No output available (TCP/UDP/ZMQ all unavailable), "
                          "streaming thread stopping"
                       << std::endl;
             return;
         }
 
         encoding_enabled.store(true);
-        send_enabled.store(tcp_initialized);
+        send_enabled.store(tcp_initialized || udp_initialized);
 
         CameraRequestData config = SnapshotCurrentCameraConfig(nullptr);
         int capture_fps = config.fps > 0 ? config.fps : 30;
@@ -837,10 +920,13 @@ void streamingThreadFunction() {
             if (use_stereo_sbs) {
                 /* 设备已输出左右并排，仅缩放至 Pico 请求分辨率 */
                 side_by_side = bgra;
-                if (side_by_side.cols < 2 * side_by_side.rows) {
+                static std::atomic<int64_t> last_warn_us{0};
+                int64_t now_us = GetUnixTimeMicroseconds();
+                if (now_us - last_warn_us.load() > 5000000) { /* 每 5 秒最多一次 */
                     std::cout << "[warn] stereo-sbs 模式下输入宽高比偏小: "
                               << side_by_side.cols << "x" << side_by_side.rows
                               << "，请确认设备输出是否为左右拼接" << std::endl;
+                    last_warn_us.store(now_us);
                 }
             } else {
                 /* 单目模拟 ZED SIDE_BY_SIDE：复制左右两半 */
