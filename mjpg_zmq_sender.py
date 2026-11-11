@@ -96,33 +96,33 @@ def _worker(
     stats: CameraStats,
 ) -> None:
     capture = cv2.VideoCapture(spec.device, cv2.CAP_V4L2)
-    if not capture.isOpened():
-        raise RuntimeError(f"{spec.role}: cannot open {spec.device}")
-
-    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    capture.set(cv2.CAP_PROP_FPS, args.fps)
-
-    actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = capture.get(cv2.CAP_PROP_FPS)
-    if (actual_width, actual_height) != (args.width, args.height):
-        raise RuntimeError(
-            f"{spec.role}: camera selected {actual_width}x{actual_height}, requested {args.width}x{args.height}"
-        )
-    if actual_fps + 1e-3 < args.fps * 0.9:
-        raise RuntimeError(f"{spec.role}: camera accepted only {actual_fps:.2f} FPS, requested {args.fps}")
-
-    socket = context.socket(zmq.PUB)
-    socket.bind(spec.endpoint)
-    print(
-        f"{spec.role}: {spec.device} -> {spec.endpoint}, "
-        f"{actual_width}x{actual_height}@{actual_fps:.1f}, MJPG input / {args.encoding} ZMQ",
-        flush=True,
-    )
-
+    socket = None
     try:
+        if not capture.isOpened():
+            raise RuntimeError(f"{spec.role}: cannot open {spec.device}")
+
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        capture.set(cv2.CAP_PROP_FPS, args.fps)
+
+        actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = capture.get(cv2.CAP_PROP_FPS)
+        if (actual_width, actual_height) != (args.width, args.height):
+            raise RuntimeError(
+                f"{spec.role}: camera selected {actual_width}x{actual_height}, requested {args.width}x{args.height}"
+            )
+        if actual_fps + 1e-3 < args.fps * 0.9:
+            raise RuntimeError(f"{spec.role}: camera accepted only {actual_fps:.2f} FPS, requested {args.fps}")
+
+        socket = context.socket(zmq.PUB)
+        socket.bind(spec.endpoint)
+        print(
+            f"{spec.role}: {spec.device} -> {spec.endpoint}, "
+            f"{actual_width}x{actual_height}@{actual_fps:.1f}, MJPG input / {args.encoding} ZMQ",
+            flush=True,
+        )
         while not stop.is_set():
             ok, frame = capture.read()
             if not ok:
@@ -142,7 +142,8 @@ def _worker(
             stats.bytes_sent += len(payload)
             stats.last_seq += 1
     finally:
-        socket.close(linger=0)
+        if socket is not None:
+            socket.close(linger=0)
         capture.release()
 
 
@@ -178,27 +179,44 @@ def main(argv: list[str] | None = None) -> int:
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda _signum, _frame: stop.set())
     signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
+    timer = None
     if args.duration > 0:
-        threading.Timer(args.duration, stop.set).start()
+        timer = threading.Timer(args.duration, stop.set)
+        timer.daemon = True
+        timer.start()
 
     context = zmq.Context()
     stats = {spec.role: CameraStats() for spec in specs}
+    failures = []
+
+    def run_worker(spec: CameraSpec) -> None:
+        try:
+            _worker(spec, args, context, stop, stats[spec.role])
+        except Exception as exc:
+            failures.append(exc)
+            print(f"{spec.role}: {exc}", file=sys.stderr, flush=True)
+            stop.set()
+
     threads = [
-        threading.Thread(target=_worker, args=(spec, args, context, stop, stats[spec.role]), daemon=True)
+        threading.Thread(target=run_worker, args=(spec,), daemon=True)
         for spec in specs
     ]
     started = time.monotonic()
-    for thread in threads:
-        thread.start()
-    while any(thread.is_alive() for thread in threads) and not stop.is_set():
-        time.sleep(1.0)
+    try:
+        for thread in threads:
+            thread.start()
+        while any(thread.is_alive() for thread in threads) and not stop.wait(1.0):
+            _report(specs, stats, started)
+    finally:
+        stop.set()
+        if timer is not None:
+            timer.cancel()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join()
         _report(specs, stats, started)
-    stop.set()
-    for thread in threads:
-        thread.join()
-    _report(specs, stats, started)
-    context.term()
-    return 0
+        context.term()
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

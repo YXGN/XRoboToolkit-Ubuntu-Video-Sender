@@ -118,6 +118,20 @@ make
 ./OrinVideoSender --help
 ```
 
+### Python MJPEG / XRAW v2 发送器
+
+`mjpg_zmq_sender.py` 需要 Python 3、OpenCV（`cv2`）与 `pyzmq`。
+`start_three_cams_mjpg_sbs.sh` 启动 SBS 头部相机和两路腕部相机；
+`start_four_cams_mjpg_new.sh` 另可启动 Pico 通道（`ENABLE_PICO=0` 可关闭）。
+运行前按本机环境设置 `BIND_IP`、相机设备与分辨率等环境变量。
+
+Python 发送器使用 **XRAW v2**，支持 `jpeg` 与 `raw_bgr` 载荷，
+需要接收端实现对应版本；本仓库 `zmq_receiver.py` 尚不支持 XRAW v2。
+它与 C++ 发送器的 XRAW v1 格式不同。
+任一 Python 相机线程失败会返回非零状态；上述启动脚本会停止其余发送器并返回退出状态。
+
+无硬件回归检查：`python3 -B -m unittest -v test_mjpg_zmq_sender`。
+
 ### OpenCV 采集链路独立测速
 
 如果你怀疑问题不在网络而在 `OpenCV VideoCapture -> cap.read()`，可以先独立测速：

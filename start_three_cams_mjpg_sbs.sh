@@ -53,7 +53,7 @@ start_camera() {
   local height="$5"
   local fps="$6"
   echo "${role} JPEG -> tcp://${BIND_IP}:${port} cam=${device} ${width}x${height}@${fps}"
-  python "${SENDER_PY}" \
+  python3 "${SENDER_PY}" \
     --camera "${role}=${device}" \
     --bind "${role}=tcp://${BIND_IP}:${port}" \
     --width "${width}" \
@@ -77,4 +77,5 @@ echo "PICO stereo sender is intentionally not started by this VelaBot-only scrip
 echo
 echo "Press Ctrl+C to stop all."
 
-wait
+# Stop the other senders when one exits, preserving its exit status.
+wait -n "${pids[@]}"

@@ -56,7 +56,7 @@ start_camera() {
   local device="$2"
   local port="$3"
   echo "${role} JPEG -> tcp://${BIND_IP}:${port}  cam=${device}  ${WIDTH}x${HEIGHT}@${FPS}"
-  python "${SENDER_PY}" \
+  python3 "${SENDER_PY}" \
     --camera "${role}=${device}" \
     --bind "${role}=tcp://${BIND_IP}:${port}" \
     --width "${WIDTH}" \
@@ -95,4 +95,5 @@ echo "  fps / jpeg quality       : ${FPS} / ${JPEG_QUALITY}"
 echo
 echo "Press Ctrl+C to stop all."
 
-wait
+# Stop the other senders when one exits, preserving its exit status.
+wait -n "${pids[@]}"
